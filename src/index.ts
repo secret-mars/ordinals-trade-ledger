@@ -37,6 +37,33 @@ function json(data: unknown, status = 200, origin = '*'): Response {
   });
 }
 
+// Auth: require BIP-137 signature on all write endpoints
+// Signature message format: "ordinals-ledger | {type} | {from_agent} | {inscription_id} | {timestamp}"
+// Timestamp must be within 300 seconds of server time
+function validateAuth(body: any): string | null {
+  if (!body.from_agent) return 'Required: from_agent';
+  if (!body.signature) return 'Required: signature (BIP-137 signed message)';
+  if (!body.timestamp) return 'Required: timestamp (ISO 8601)';
+
+  // Validate signature format (base64-encoded BIP-137 = 88 chars)
+  if (typeof body.signature !== 'string' || body.signature.length < 80 || body.signature.length > 100) {
+    return 'Invalid signature format (expected base64 BIP-137, ~88 chars)';
+  }
+
+  // Validate timestamp is recent (within 300 seconds)
+  const ts = new Date(body.timestamp).getTime();
+  if (isNaN(ts)) return 'Invalid timestamp format';
+  const drift = Math.abs(Date.now() - ts);
+  if (drift > 300_000) return 'Timestamp expired (must be within 300 seconds of server time)';
+
+  // Transfer type requires tx_hash for on-chain verification
+  if (body.type === 'transfer' && !body.tx_hash) {
+    return 'Transfer trades require tx_hash for on-chain verification';
+  }
+
+  return null;
+}
+
 async function ensureAgent(db: D1Database, btcAddress: string, displayName?: string, stxAddress?: string) {
   await db
     .prepare(
@@ -64,7 +91,7 @@ export default {
     // POST /api/trades — Log a new trade event
     if (request.method === 'POST' && path === '/api/trades') {
       try {
-        const body = (await request.json()) as TradeInput;
+        const body = (await request.json()) as TradeInput & { signature?: string; timestamp?: string };
 
         if (!body.type || !body.from_agent || !body.inscription_id) {
           return json({ error: 'Missing required fields: type, from_agent, inscription_id' }, 400, origin);
@@ -73,6 +100,9 @@ export default {
         if (!['offer', 'counter', 'transfer', 'cancel'].includes(body.type)) {
           return json({ error: 'Invalid type. Must be: offer, counter, transfer, cancel' }, 400, origin);
         }
+
+        const authErr = validateAuth(body as any);
+        if (authErr) return json({ error: authErr }, 401, origin);
 
         // Upsert agents
         await ensureAgent(env.DB, body.from_agent, body.from_display_name, body.from_stx_address);
