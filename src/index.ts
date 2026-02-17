@@ -157,7 +157,7 @@ export default {
 
         return json({ success: true, trade_id: result.meta.last_row_id }, 201, origin);
       } catch (e: any) {
-        return json({ error: e.message }, 500, origin);
+        return json({ error: 'Internal server error' }, 500, origin);
       }
     }
 
@@ -167,8 +167,10 @@ export default {
       const agent = url.searchParams.get('agent');
       const inscription = url.searchParams.get('inscription');
       const status = url.searchParams.get('status');
-      const limit = Math.min(parseInt(url.searchParams.get('limit') || '50'), 200);
-      const offset = parseInt(url.searchParams.get('offset') || '0');
+      const limitRaw = parseInt(url.searchParams.get('limit') || '50');
+      const offsetRaw = parseInt(url.searchParams.get('offset') || '0');
+      const limit = Math.min(Math.max(isNaN(limitRaw) ? 50 : limitRaw, 1), 200);
+      const offset = Math.max(isNaN(offsetRaw) ? 0 : offsetRaw, 0);
 
       let query = `
         SELECT t.*,
@@ -450,29 +452,38 @@ async function loadTrades() {
     }
 
     list.innerHTML = d.trades.map(t => {
-      const fromName = t.from_name || truncAddr(t.from_agent);
-      const toName = t.to_name || truncAddr(t.to_agent);
-      const inscriptionShort = t.inscription_id.length > 20
+      const fromName = esc(t.from_name || truncAddr(t.from_agent));
+      const toName = esc(t.to_name || truncAddr(t.to_agent));
+      const safeFromAgent = esc(t.from_agent);
+      const safeToAgent = esc(t.to_agent);
+      const safeInscription = esc(t.inscription_id);
+      const inscriptionShort = esc(t.inscription_id.length > 20
         ? t.inscription_id.slice(0, 12) + '...' + t.inscription_id.slice(-8)
-        : t.inscription_id;
+        : t.inscription_id);
+      const safeTxHash = esc(t.tx_hash);
 
       return '<div class="trade">' +
         '<div class="trade-header">' +
-          '<span class="trade-type ' + t.type + '">' + t.type + '</span>' +
-          '<span class="status ' + t.status + '">' + t.status + '</span>' +
-          '<span class="trade-time">' + timeAgo(t.created_at) + '</span>' +
+          '<span class="trade-type ' + esc(t.type) + '">' + esc(t.type) + '</span>' +
+          '<span class="status ' + esc(t.status) + '">' + esc(t.status) + '</span>' +
+          '<span class="trade-time">' + esc(timeAgo(t.created_at)) + '</span>' +
         '</div>' +
         '<div class="trade-body">' +
           '<div class="trade-agents">' +
-            '<span class="agent" onclick="filterAgent(\\'' + t.from_agent + '\\')">' + fromName + '</span>' +
-            (t.to_agent ? ' <span class="arrow">&rarr;</span> <span class="agent" onclick="filterAgent(\\'' + t.to_agent + '\\')">' + toName + '</span>' : '') +
+            '<span class="agent" data-addr="' + safeFromAgent + '">' + fromName + '</span>' +
+            (t.to_agent ? ' <span class="arrow">&rarr;</span> <span class="agent" data-addr="' + safeToAgent + '">' + toName + '</span>' : '') +
           '</div>' +
-          '<span class="inscription" onclick="window.open(\\'https://ordinals.com/inscription/' + t.inscription_id + '\\', \\'_blank\\')">' + inscriptionShort + '</span>' +
+          '<a class="inscription" href="https://ordinals.com/inscription/' + encodeURIComponent(t.inscription_id) + '" target="_blank" rel="noopener">' + inscriptionShort + '</a>' +
           (t.amount_sats ? ' &mdash; <span class="amount">' + formatSats(t.amount_sats) + '</span>' : '') +
-          (t.tx_hash ? ' &mdash; <a href="https://mempool.space/tx/' + t.tx_hash + '" target="_blank" style="font-size:11px;">tx</a>' : '') +
+          (t.tx_hash ? ' &mdash; <a href="https://mempool.space/tx/' + encodeURIComponent(t.tx_hash) + '" target="_blank" rel="noopener" style="font-size:11px;">tx</a>' : '') +
         '</div>' +
       '</div>';
     }).join('');
+
+    // Bind click handlers safely (no inline onclick)
+    list.querySelectorAll('.agent[data-addr]').forEach(el => {
+      el.addEventListener('click', () => filterAgent(el.dataset.addr));
+    });
 
     const page = Math.floor(offset / limit) + 1;
     const totalPages = Math.ceil(d.pagination.total / limit);
@@ -483,6 +494,8 @@ async function loadTrades() {
     list.innerHTML = '<div class="empty">Error loading trades</div>';
   }
 }
+
+function esc(s) { if (!s) return ''; const d=document.createElement('div'); d.textContent=s; return d.innerHTML; }
 
 function filterAgent(addr) {
   document.getElementById('filter-agent').value = addr;
