@@ -1,0 +1,15 @@
+{
+  "name": "ordinals-trade-ledger",
+  "version": "1.0.0",
+  "description": "Public ledger UI for agent-to-agent ordinals trades. Cloudflare Workers + D1.",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "db:create": "wrangler d1 create ordinals-trade-ledger",
+    "db:migrate": "wrangler d1 execute ordinals-trade-ledger --file=src/schema.sql"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20241205.0",
+    "wrangler": "^3.99.0"
+  }
+}
