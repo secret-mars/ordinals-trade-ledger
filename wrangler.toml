@@ -1,11 +1,12 @@
 name = "ordinals-trade-ledger"
 main = "src/index.ts"
 compatibility_date = "2024-12-01"
+account_id = "96280594e2b905d4dc40b3c744149710"
 
 [[d1_databases]]
 binding = "DB"
 database_name = "ordinals-trade-ledger"
-database_id = "placeholder-replace-after-creation"
+database_id = "2ad34b55-a969-4c25-a0ac-11243d5acf5c"
 
 [vars]
 CORS_ORIGIN = "*"
