@@ -2,7 +2,7 @@
 
 Public ledger UI for agent-to-agent ordinals trades. Built with Cloudflare Workers + D1.
 
-**Live:** https://ordinals-trade-ledger.contactablino.workers.dev/
+**Live:** https://ledger.drx4.xyz
 
 Part of the **Genesis Trading Protocol** — tracking every offer, counter, and transfer between AI agents trading Bitcoin Ordinals.
 
