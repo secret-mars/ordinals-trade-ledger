@@ -9,7 +9,7 @@ interface Env {
 }
 
 interface TradeInput {
-  type: 'offer' | 'counter' | 'transfer' | 'cancel';
+  type: 'offer' | 'counter' | 'transfer' | 'cancel' | 'psbt_swap';
   from_agent: string;
   to_agent?: string;
   inscription_id: string;
@@ -57,9 +57,16 @@ function validateAuth(body: any): string | null {
   const drift = Math.abs(Date.now() - ts);
   if (drift > 300_000) return 'Timestamp expired (must be within 300 seconds of server time)';
 
-  // Transfer type requires tx_hash for on-chain verification
-  if (body.type === 'transfer' && !body.tx_hash) {
-    return 'Transfer trades require tx_hash for on-chain verification';
+  // Transfer and psbt_swap types require tx_hash for on-chain verification
+  if ((body.type === 'transfer' || body.type === 'psbt_swap') && !body.tx_hash) {
+    return body.type === 'psbt_swap'
+      ? 'PSBT swaps require tx_hash (the atomic swap transaction)'
+      : 'Transfer trades require tx_hash for on-chain verification';
+  }
+
+  // PSBT swaps require both parties
+  if (body.type === 'psbt_swap' && !body.to_agent) {
+    return 'PSBT swaps require to_agent (the counterparty)';
   }
 
   return null;
@@ -324,8 +331,8 @@ export default {
           return json({ error: 'Missing required fields: type, from_agent, inscription_id' }, 400, origin);
         }
 
-        if (!['offer', 'counter', 'transfer', 'cancel'].includes(body.type)) {
-          return json({ error: 'Invalid type. Must be: offer, counter, transfer, cancel' }, 400, origin);
+        if (!['offer', 'counter', 'transfer', 'cancel', 'psbt_swap'].includes(body.type)) {
+          return json({ error: 'Invalid type. Must be: offer, counter, transfer, cancel, psbt_swap' }, 400, origin);
         }
 
         const authErr = validateAuth(body as any);
@@ -341,6 +348,7 @@ export default {
         let status = 'open';
         if (body.type === 'counter') status = 'countered';
         if (body.type === 'transfer') status = 'completed';
+        if (body.type === 'psbt_swap') status = 'completed';
         if (body.type === 'cancel') status = 'cancelled';
 
         const result = await env.DB
@@ -478,6 +486,7 @@ export default {
         env.DB.prepare('SELECT COUNT(*) as completed FROM trades WHERE status = \'completed\''),
         env.DB.prepare('SELECT COALESCE(SUM(amount_sats), 0) as total_volume_sats FROM trades WHERE status = \'completed\''),
         env.DB.prepare('SELECT COUNT(DISTINCT inscription_id) as unique_inscriptions FROM trades'),
+        env.DB.prepare('SELECT COUNT(*) as psbt_swaps FROM trades WHERE type = \'psbt_swap\''),
       ]);
 
       return json({
@@ -487,6 +496,7 @@ export default {
         completed_trades: (stats[3].results[0] as any)?.completed || 0,
         total_volume_sats: (stats[4].results[0] as any)?.total_volume_sats || 0,
         unique_inscriptions: (stats[5].results[0] as any)?.unique_inscriptions || 0,
+        psbt_swaps: (stats[6].results[0] as any)?.psbt_swaps || 0,
       }, 200, origin);
     }
 
@@ -551,6 +561,9 @@ const FRONTEND_HTML = `<!DOCTYPE html>
     --blue-dim: rgba(0, 170, 255, 0.08);
     --red: #ff3355;
     --red-dim: rgba(255, 51, 85, 0.08);
+    --purple: #b44dff;
+    --purple-dim: rgba(180, 77, 255, 0.08);
+    --purple-glow: rgba(180, 77, 255, 0.25);
   }
 
   * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -797,6 +810,7 @@ const FRONTEND_HTML = `<!DOCTYPE html>
   .chart-bar.counter { background: linear-gradient(180deg, var(--orange), rgba(247,147,26,0.4)); box-shadow: 0 0 8px var(--orange-glow); }
   .chart-bar.transfer { background: linear-gradient(180deg, var(--neon-green), rgba(0,255,136,0.4)); box-shadow: 0 0 8px var(--neon-green-glow); }
   .chart-bar.cancel { background: linear-gradient(180deg, var(--red), rgba(255,51,85,0.4)); box-shadow: 0 0 8px rgba(255,51,85,0.3); }
+  .chart-bar.psbt_swap { background: linear-gradient(180deg, var(--purple), rgba(180,77,255,0.4)); box-shadow: 0 0 8px var(--purple-glow); }
 
   .chart-bar-label {
     font-size: 9px;
@@ -895,6 +909,7 @@ const FRONTEND_HTML = `<!DOCTYPE html>
   .trade[data-type="offer"]    { border-left-color: var(--blue); }
   .trade[data-type="counter"]  { border-left-color: var(--orange); }
   .trade[data-type="cancel"]   { border-left-color: var(--red); }
+  .trade[data-type="psbt_swap"] { border-left-color: var(--purple); }
 
   .trade:hover {
     background: var(--surface2);
@@ -906,6 +921,7 @@ const FRONTEND_HTML = `<!DOCTYPE html>
   .trade[data-type="offer"]:hover    { box-shadow: 0 2px 20px var(--blue-dim); }
   .trade[data-type="counter"]:hover  { box-shadow: 0 2px 20px var(--orange-dim); }
   .trade[data-type="cancel"]:hover   { box-shadow: 0 2px 20px var(--red-dim); }
+  .trade[data-type="psbt_swap"]:hover { box-shadow: 0 2px 20px var(--purple-dim); }
 
   .trade-header {
     display: flex;
@@ -928,6 +944,7 @@ const FRONTEND_HTML = `<!DOCTYPE html>
   .trade-type.counter  { color: var(--orange);     background: var(--orange-dim);      border: 1px solid rgba(247,147,26,0.2); }
   .trade-type.transfer { color: var(--neon-green); background: var(--neon-green-dim);  border: 1px solid rgba(0,255,136,0.2); }
   .trade-type.cancel   { color: var(--red);        background: var(--red-dim);         border: 1px solid rgba(255,51,85,0.2); }
+  .trade-type.psbt_swap { color: var(--purple);    background: var(--purple-dim);      border: 1px solid rgba(180,77,255,0.2); }
 
   .status {
     font-size: 10px;
@@ -1170,6 +1187,7 @@ const FRONTEND_HTML = `<!DOCTYPE html>
     <div class="stat"><div class="value" id="stat-completed">-</div><div class="label">Completed</div></div>
     <div class="stat"><div class="value" id="stat-volume">-</div><div class="label">Volume (sats)</div></div>
     <div class="stat"><div class="value" id="stat-inscriptions">-</div><div class="label">Inscriptions</div></div>
+    <div class="stat"><div class="value" id="stat-swaps">-</div><div class="label">PSBT Swaps</div></div>
   </div>
 
   <div class="chart-section" id="chart-section" style="display:none;">
@@ -1195,6 +1213,11 @@ const FRONTEND_HTML = `<!DOCTYPE html>
         <div class="chart-bar-wrap"><div class="chart-bar cancel" id="chart-bar-cancel" style="height:2px;"></div></div>
         <div class="chart-bar-label">Cancels</div>
       </div>
+      <div class="chart-bar-group">
+        <div class="chart-bar-value" id="chart-val-psbt_swap">0</div>
+        <div class="chart-bar-wrap"><div class="chart-bar psbt_swap" id="chart-bar-psbt_swap" style="height:2px;"></div></div>
+        <div class="chart-bar-label">PSBT Swaps</div>
+      </div>
     </div>
   </div>
 
@@ -1206,6 +1229,7 @@ const FRONTEND_HTML = `<!DOCTYPE html>
       <option value="counter">Counters</option>
       <option value="transfer">Transfers</option>
       <option value="cancel">Cancels</option>
+      <option value="psbt_swap">PSBT Swaps</option>
     </select>
     <select id="filter-status">
       <option value="">All Status</option>
@@ -1289,17 +1313,17 @@ function makeAvatar(addr) {
 }
 
 // Chart update: fetch trade type counts from current trades in view and update bars
-let chartData = { offer: 0, counter: 0, transfer: 0, cancel: 0 };
+let chartData = { offer: 0, counter: 0, transfer: 0, cancel: 0, psbt_swap: 0 };
 
 function updateChart(trades) {
-  const counts = { offer: 0, counter: 0, transfer: 0, cancel: 0 };
+  const counts = { offer: 0, counter: 0, transfer: 0, cancel: 0, psbt_swap: 0 };
   if (trades && trades.length) {
     trades.forEach(t => { if (counts[t.type] !== undefined) counts[t.type]++; });
   }
   chartData = counts;
-  const maxVal = Math.max(1, counts.offer, counts.counter, counts.transfer, counts.cancel);
+  const maxVal = Math.max(1, counts.offer, counts.counter, counts.transfer, counts.cancel, counts.psbt_swap);
   const maxBarH = 44; // px
-  ['offer', 'counter', 'transfer', 'cancel'].forEach(type => {
+  ['offer', 'counter', 'transfer', 'cancel', 'psbt_swap'].forEach(type => {
     const bar = document.getElementById('chart-bar-' + type);
     const val = document.getElementById('chart-val-' + type);
     if (bar) bar.style.height = Math.max(2, Math.round((counts[type] / maxVal) * maxBarH)) + 'px';
@@ -1319,6 +1343,7 @@ async function loadStats() {
     document.getElementById('stat-completed').textContent = d.completed_trades;
     document.getElementById('stat-volume').textContent = d.total_volume_sats.toLocaleString();
     document.getElementById('stat-inscriptions').textContent = d.unique_inscriptions;
+    document.getElementById('stat-swaps').textContent = d.psbt_swaps || 0;
   } catch (e) {
     console.error('Stats error:', e);
   }
@@ -1367,10 +1392,11 @@ async function loadTrades() {
 
       const fromAvatar = makeAvatar(t.from_agent);
       const toAvatar = makeAvatar(t.to_agent);
+      const typeLabel = t.type === 'psbt_swap' ? 'PSBT Swap' : t.type;
 
       return '<div class="trade" data-id="' + t.id + '" data-type="' + esc(t.type) + '">' +
         '<div class="trade-header">' +
-          '<span class="trade-type ' + esc(t.type) + '">' + esc(t.type) + sourceBadge + '</span>' +
+          '<span class="trade-type ' + esc(t.type) + '">' + esc(typeLabel) + sourceBadge + '</span>' +
           '<span class="status ' + esc(t.status) + '">' + esc(t.status) + '</span>' +
           '<span class="trade-time">' + esc(timeAgo(t.created_at)) + '</span>' +
         '</div>' +

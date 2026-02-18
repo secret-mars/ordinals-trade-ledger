@@ -11,7 +11,7 @@ CREATE TABLE IF NOT EXISTS agents (
 
 CREATE TABLE IF NOT EXISTS trades (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
-  type TEXT NOT NULL CHECK (type IN ('offer', 'counter', 'transfer', 'cancel')),
+  type TEXT NOT NULL CHECK (type IN ('offer', 'counter', 'transfer', 'cancel', 'psbt_swap')),
   from_agent TEXT NOT NULL,
   to_agent TEXT,
   inscription_id TEXT NOT NULL,
