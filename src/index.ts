@@ -26,7 +26,7 @@ interface TradeInput {
 function corsHeaders(origin: string): HeadersInit {
   return {
     'Access-Control-Allow-Origin': origin,
-    'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+    'Access-Control-Allow-Methods': 'GET, POST, PATCH, DELETE, OPTIONS',
     'Access-Control-Allow-Headers': 'Content-Type',
   };
 }
@@ -378,6 +378,14 @@ export default {
             .run();
         }
 
+        // Auto-close marketplace listings when a psbt_swap or transfer completes for the same inscription
+        if ((body.type === 'psbt_swap' || body.type === 'transfer') && body.inscription_id) {
+          await env.DB
+            .prepare("UPDATE listings SET status = 'sold', trade_id = ?, updated_at = datetime('now') WHERE inscription_id = ? AND status = 'active'")
+            .bind(result.meta.last_row_id, body.inscription_id)
+            .run();
+        }
+
         // Increment trade counts
         await env.DB
           .prepare('UPDATE agents SET trade_count = trade_count + 1 WHERE btc_address = ?')
@@ -487,6 +495,8 @@ export default {
         env.DB.prepare('SELECT COALESCE(SUM(amount_sats), 0) as total_volume_sats FROM trades WHERE status = \'completed\''),
         env.DB.prepare('SELECT COUNT(DISTINCT inscription_id) as unique_inscriptions FROM trades'),
         env.DB.prepare('SELECT COUNT(*) as psbt_swaps FROM trades WHERE type = \'psbt_swap\''),
+        env.DB.prepare('SELECT COUNT(*) as active_listings FROM listings WHERE status = \'active\''),
+        env.DB.prepare('SELECT COUNT(*) as total_listings FROM listings'),
       ]);
 
       return json({
@@ -497,6 +507,8 @@ export default {
         total_volume_sats: (stats[4].results[0] as any)?.total_volume_sats || 0,
         unique_inscriptions: (stats[5].results[0] as any)?.unique_inscriptions || 0,
         psbt_swaps: (stats[6].results[0] as any)?.psbt_swaps || 0,
+        active_listings: (stats[7].results[0] as any)?.active_listings || 0,
+        total_listings: (stats[8].results[0] as any)?.total_listings || 0,
       }, 200, origin);
     }
 
@@ -517,6 +529,158 @@ export default {
           total_inscriptions: snapshotStats?.total_inscriptions || 0,
         },
       }, 200, origin);
+    }
+
+    // --- Marketplace Listings ---
+
+    // POST /api/listings — Create a new listing (list an ordinal for sale)
+    if (request.method === 'POST' && path === '/api/listings') {
+      try {
+        const body = await request.json() as any;
+
+        if (!body.inscription_id || !body.seller_btc_address || !body.price_floor_sats) {
+          return json({ error: 'Required: inscription_id, seller_btc_address, price_floor_sats' }, 400, origin);
+        }
+
+        if (typeof body.price_floor_sats !== 'number' || body.price_floor_sats <= 0) {
+          return json({ error: 'price_floor_sats must be a positive number' }, 400, origin);
+        }
+
+        // Auth: seller must sign
+        if (!body.signature || !body.timestamp) {
+          return json({ error: 'Required: signature (BIP-137), timestamp (ISO 8601)' }, 401, origin);
+        }
+
+        const ts = new Date(body.timestamp).getTime();
+        if (isNaN(ts) || Math.abs(Date.now() - ts) > 300_000) {
+          return json({ error: 'Timestamp expired or invalid (must be within 300s)' }, 401, origin);
+        }
+
+        if (typeof body.signature !== 'string' || body.signature.length < 80 || body.signature.length > 100) {
+          return json({ error: 'Invalid signature format' }, 401, origin);
+        }
+
+        // Check no active listing for same inscription by same seller
+        const existing = await env.DB
+          .prepare("SELECT id FROM listings WHERE inscription_id = ? AND seller_btc_address = ? AND status = 'active'")
+          .bind(body.inscription_id, body.seller_btc_address)
+          .first();
+
+        if (existing) {
+          return json({ error: 'Active listing already exists for this inscription' }, 409, origin);
+        }
+
+        // Upsert seller agent
+        await ensureAgent(env.DB, body.seller_btc_address, body.seller_display_name, body.seller_stx_address);
+
+        const result = await env.DB
+          .prepare(
+            `INSERT INTO listings (inscription_id, seller_btc_address, price_floor_sats, description)
+             VALUES (?, ?, ?, ?)`
+          )
+          .bind(body.inscription_id, body.seller_btc_address, body.price_floor_sats, body.description || null)
+          .run();
+
+        return json({ success: true, listing_id: result.meta.last_row_id }, 201, origin);
+      } catch (e: any) {
+        return json({ error: 'Internal server error' }, 500, origin);
+      }
+    }
+
+    // GET /api/listings — Browse marketplace listings
+    if (request.method === 'GET' && path === '/api/listings') {
+      const status = url.searchParams.get('status') || 'active';
+      const seller = url.searchParams.get('seller');
+      const inscription = url.searchParams.get('inscription');
+      const sort = url.searchParams.get('sort') || 'newest'; // newest, cheapest, expensive
+      const limitRaw = parseInt(url.searchParams.get('limit') || '50');
+      const offsetRaw = parseInt(url.searchParams.get('offset') || '0');
+      const lim = Math.min(Math.max(isNaN(limitRaw) ? 50 : limitRaw, 1), 200);
+      const off = Math.max(isNaN(offsetRaw) ? 0 : offsetRaw, 0);
+
+      let query = `
+        SELECT l.*, a.display_name as seller_name, a.stx_address as seller_stx
+        FROM listings l
+        LEFT JOIN agents a ON l.seller_btc_address = a.btc_address
+        WHERE 1=1
+      `;
+      const params: (string | number)[] = [];
+
+      if (status !== 'all') { query += ' AND l.status = ?'; params.push(status); }
+      if (seller) { query += ' AND l.seller_btc_address = ?'; params.push(seller); }
+      if (inscription) { query += ' AND l.inscription_id = ?'; params.push(inscription); }
+
+      if (sort === 'cheapest') query += ' ORDER BY l.price_floor_sats ASC';
+      else if (sort === 'expensive') query += ' ORDER BY l.price_floor_sats DESC';
+      else query += ' ORDER BY l.created_at DESC';
+
+      query += ' LIMIT ? OFFSET ?';
+      params.push(lim, off);
+
+      const listings = await env.DB.prepare(query).bind(...params).all();
+
+      // Count
+      let countQuery = 'SELECT COUNT(*) as total FROM listings WHERE 1=1';
+      const countParams: (string | number)[] = [];
+      if (status !== 'all') { countQuery += ' AND status = ?'; countParams.push(status); }
+      if (seller) { countQuery += ' AND seller_btc_address = ?'; countParams.push(seller); }
+      if (inscription) { countQuery += ' AND inscription_id = ?'; countParams.push(inscription); }
+
+      const count = await env.DB.prepare(countQuery).bind(...countParams).first<{ total: number }>();
+
+      return json({
+        listings: listings.results,
+        pagination: { total: count?.total || 0, limit: lim, offset: off, hasMore: off + lim < (count?.total || 0) }
+      }, 200, origin);
+    }
+
+    // PATCH /api/listings/:id — Update listing (delist or mark sold)
+    if (request.method === 'PATCH' && path.match(/^\/api\/listings\/\d+$/)) {
+      try {
+        const id = parseInt(path.split('/').pop()!);
+        const body = await request.json() as any;
+
+        if (!body.status || !['delisted', 'sold'].includes(body.status)) {
+          return json({ error: 'status must be "delisted" or "sold"' }, 400, origin);
+        }
+
+        // Auth required
+        if (!body.signature || !body.timestamp || !body.seller_btc_address) {
+          return json({ error: 'Required: seller_btc_address, signature, timestamp' }, 401, origin);
+        }
+
+        const ts = new Date(body.timestamp).getTime();
+        if (isNaN(ts) || Math.abs(Date.now() - ts) > 300_000) {
+          return json({ error: 'Timestamp expired or invalid' }, 401, origin);
+        }
+
+        if (typeof body.signature !== 'string' || body.signature.length < 80 || body.signature.length > 100) {
+          return json({ error: 'Invalid signature format' }, 401, origin);
+        }
+
+        // Verify listing exists and seller matches
+        const listing = await env.DB
+          .prepare("SELECT * FROM listings WHERE id = ? AND status = 'active'")
+          .bind(id)
+          .first<any>();
+
+        if (!listing) {
+          return json({ error: 'Listing not found or not active' }, 404, origin);
+        }
+
+        if (listing.seller_btc_address !== body.seller_btc_address) {
+          return json({ error: 'Only the seller can update this listing' }, 403, origin);
+        }
+
+        await env.DB
+          .prepare("UPDATE listings SET status = ?, trade_id = ?, updated_at = datetime('now') WHERE id = ?")
+          .bind(body.status, body.trade_id || null, id)
+          .run();
+
+        return json({ success: true }, 200, origin);
+      } catch (e: any) {
+        return json({ error: 'Internal server error' }, 500, origin);
+      }
     }
 
     // GET / — Serve the public ledger UI
@@ -1153,6 +1317,64 @@ const FRONTEND_HTML = `<!DOCTYPE html>
 
   footer .footer-dot { margin: 0 8px; }
 
+  /* ---- TAB BAR ---- */
+  .tab-btn {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    color: var(--dim);
+    padding: 8px 20px;
+    font-family: inherit;
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 1.5px;
+    text-transform: uppercase;
+    cursor: pointer;
+    transition: all 0.15s;
+    border-radius: 4px;
+  }
+
+  .tab-btn:hover { border-color: var(--border-bright); color: var(--text); }
+
+  .tab-btn.active {
+    background: var(--neon-green-dim);
+    border-color: rgba(0,255,136,0.3);
+    color: var(--neon-green);
+  }
+
+  /* ---- LISTING CARD ---- */
+  .listing-card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-left: 3px solid var(--neon-green);
+    border-radius: 6px;
+    padding: 16px;
+    transition: border-color 0.2s, box-shadow 0.2s, background 0.2s;
+  }
+
+  .listing-card:hover {
+    background: var(--surface2);
+    border-color: var(--border-bright);
+    box-shadow: 0 2px 20px var(--neon-green-dim);
+  }
+
+  .listing-card.sold { border-left-color: var(--dim); opacity: 0.6; }
+  .listing-card.delisted { border-left-color: var(--red); opacity: 0.5; }
+
+  .listing-price {
+    font-size: 22px;
+    font-weight: 700;
+    color: var(--neon-green);
+    font-family: 'SF Mono', 'Fira Code', monospace;
+    letter-spacing: -0.5px;
+  }
+
+  .listing-desc {
+    font-size: 12px;
+    color: var(--dim);
+    margin-top: 6px;
+    line-height: 1.4;
+  }
+
   /* ---- RESPONSIVE ---- */
   @media (max-width: 600px) {
     header h1 { font-size: 20px; }
@@ -1188,6 +1410,7 @@ const FRONTEND_HTML = `<!DOCTYPE html>
     <div class="stat"><div class="value" id="stat-volume">-</div><div class="label">Volume (sats)</div></div>
     <div class="stat"><div class="value" id="stat-inscriptions">-</div><div class="label">Inscriptions</div></div>
     <div class="stat"><div class="value" id="stat-swaps">-</div><div class="label">PSBT Swaps</div></div>
+    <div class="stat" style="cursor:pointer" onclick="switchTab('marketplace')"><div class="value" id="stat-listings" style="color:var(--neon-green)">-</div><div class="label">For Sale</div></div>
   </div>
 
   <div class="chart-section" id="chart-section" style="display:none;">
@@ -1221,6 +1444,40 @@ const FRONTEND_HTML = `<!DOCTYPE html>
     </div>
   </div>
 
+  <div class="tab-bar" style="display:flex;gap:2px;margin-bottom:16px;">
+    <button class="tab-btn active" id="tab-trades" onclick="switchTab('trades')">Trade Feed</button>
+    <button class="tab-btn" id="tab-marketplace" onclick="switchTab('marketplace')">Marketplace</button>
+  </div>
+
+  <div id="marketplace-view" style="display:none;">
+    <div class="filters-bar">
+      <span class="filter-label">Sort</span>
+      <select id="listing-sort">
+        <option value="newest">Newest</option>
+        <option value="cheapest">Cheapest First</option>
+        <option value="expensive">Most Expensive</option>
+      </select>
+      <select id="listing-status">
+        <option value="active">Active</option>
+        <option value="all">All</option>
+        <option value="sold">Sold</option>
+      </select>
+      <input type="text" id="listing-filter-seller" placeholder="Filter by seller BTC address...">
+    </div>
+    <div class="section-header">
+      <span class="section-title">Ordinals For Sale</span>
+    </div>
+    <div id="listings-list" class="trades">
+      <div class="loading">Loading marketplace...</div>
+    </div>
+    <div class="pagination">
+      <button id="btn-lprev" disabled>&larr; Prev</button>
+      <span id="lpage-info">Page 1</span>
+      <button id="btn-lnext" disabled>Next &rarr;</button>
+    </div>
+  </div>
+
+  <div id="trades-view">
   <div class="filters-bar">
     <span class="filter-label">Filter</span>
     <select id="filter-type">
@@ -1253,6 +1510,7 @@ const FRONTEND_HTML = `<!DOCTYPE html>
     <button id="btn-prev" disabled>&larr; Prev</button>
     <span id="page-info">Page 1</span>
     <button id="btn-next" disabled>Next &rarr;</button>
+  </div>
   </div>
 
   <footer>
@@ -1344,6 +1602,7 @@ async function loadStats() {
     document.getElementById('stat-volume').textContent = d.total_volume_sats.toLocaleString();
     document.getElementById('stat-inscriptions').textContent = d.unique_inscriptions;
     document.getElementById('stat-swaps').textContent = d.psbt_swaps || 0;
+    document.getElementById('stat-listings').textContent = d.active_listings || 0;
   } catch (e) {
     console.error('Stats error:', e);
   }
@@ -1499,6 +1758,92 @@ document.getElementById('filter-status').addEventListener('change', () => { offs
 document.getElementById('filter-agent').addEventListener('input', () => { offset = 0; pauseAutoRefresh(); loadTrades(); });
 document.getElementById('btn-prev').addEventListener('click', () => { offset = Math.max(0, offset - limit); loadTrades(); });
 document.getElementById('btn-next').addEventListener('click', () => { offset += limit; loadTrades(); });
+
+// --- Tab switching ---
+let currentTab = 'trades';
+function switchTab(tab) {
+  currentTab = tab;
+  document.getElementById('trades-view').style.display = tab === 'trades' ? '' : 'none';
+  document.getElementById('marketplace-view').style.display = tab === 'marketplace' ? '' : 'none';
+  document.getElementById('tab-trades').classList.toggle('active', tab === 'trades');
+  document.getElementById('tab-marketplace').classList.toggle('active', tab === 'marketplace');
+  if (tab === 'marketplace') loadListings();
+}
+
+// --- Marketplace ---
+let listingOffset = 0;
+const listingLimit = 50;
+
+async function loadListings() {
+  const sort = document.getElementById('listing-sort').value;
+  const status = document.getElementById('listing-status').value;
+  const seller = document.getElementById('listing-filter-seller').value.trim();
+
+  let url = API + '/api/listings?limit=' + listingLimit + '&offset=' + listingOffset + '&sort=' + sort + '&status=' + status;
+  if (seller) url += '&seller=' + encodeURIComponent(seller);
+
+  const list = document.getElementById('listings-list');
+
+  try {
+    const r = await fetch(url);
+    const d = await r.json();
+
+    if (!d.listings || d.listings.length === 0) {
+      list.innerHTML = '<div class="empty">No listings yet. Agents can list ordinals for sale via POST /api/listings.</div>';
+      document.getElementById('btn-lprev').disabled = true;
+      document.getElementById('btn-lnext').disabled = true;
+      document.getElementById('lpage-info').textContent = 'Page 1';
+      return;
+    }
+
+    list.innerHTML = d.listings.map(l => {
+      const sellerName = esc(l.seller_name || truncAddr(l.seller_btc_address));
+      const safeInscription = esc(l.inscription_id);
+      const inscShort = esc(l.inscription_id.length > 20
+        ? l.inscription_id.slice(0, 12) + '...' + l.inscription_id.slice(-8)
+        : l.inscription_id);
+      const sellerAvatar = makeAvatar(l.seller_btc_address);
+      const statusClass = l.status === 'sold' ? 'sold' : l.status === 'delisted' ? 'delisted' : '';
+      const statusBadge = l.status !== 'active'
+        ? '<span class="status ' + (l.status === 'sold' ? 'completed' : 'cancelled') + '">' + esc(l.status) + '</span>'
+        : '<span class="status open">for sale</span>';
+
+      return '<div class="listing-card ' + statusClass + '">' +
+        '<div class="trade-header">' +
+          '<span class="listing-price">' + esc(formatSats(l.price_floor_sats)) + '</span>' +
+          statusBadge +
+          '<span class="trade-time">' + esc(timeAgo(l.created_at)) + '</span>' +
+        '</div>' +
+        '<div class="trade-body" style="margin-top:10px;">' +
+          '<div class="trade-agents">' +
+            '<span class="agent-chip" data-addr="' + esc(l.seller_btc_address) + '">' +
+              '<span class="agent-avatar">' + sellerAvatar + '</span>' +
+              '<span class="agent-name">' + sellerName + '</span>' +
+            '</span>' +
+          '</div>' +
+          '<div class="trade-meta">' +
+            '<a class="inscription" href="https://ordinals.com/inscription/' + encodeURIComponent(l.inscription_id) + '" target="_blank" rel="noopener">' + inscShort + '</a>' +
+          '</div>' +
+          (l.description ? '<div class="listing-desc">' + esc(l.description) + '</div>' : '') +
+        '</div>' +
+      '</div>';
+    }).join('');
+
+    const page = Math.floor(listingOffset / listingLimit) + 1;
+    const totalPages = Math.ceil(d.pagination.total / listingLimit);
+    document.getElementById('lpage-info').textContent = 'Page ' + page + ' / ' + totalPages;
+    document.getElementById('btn-lprev').disabled = listingOffset === 0;
+    document.getElementById('btn-lnext').disabled = !d.pagination.hasMore;
+  } catch (e) {
+    list.innerHTML = '<div class="empty">Error loading listings</div>';
+  }
+}
+
+document.getElementById('listing-sort').addEventListener('change', () => { listingOffset = 0; loadListings(); });
+document.getElementById('listing-status').addEventListener('change', () => { listingOffset = 0; loadListings(); });
+document.getElementById('listing-filter-seller').addEventListener('input', () => { listingOffset = 0; loadListings(); });
+document.getElementById('btn-lprev').addEventListener('click', () => { listingOffset = Math.max(0, listingOffset - listingLimit); loadListings(); });
+document.getElementById('btn-lnext').addEventListener('click', () => { listingOffset += listingLimit; loadListings(); });
 
 loadStats();
 loadTrades().then(updateLiveTime);
