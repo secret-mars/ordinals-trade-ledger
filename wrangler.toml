@@ -12,5 +12,8 @@ binding = "DB"
 database_name = "ordinals-trade-ledger"
 database_id = "aa569031-1697-48b5-a8ce-2c23ed3a90bb"
 
+[triggers]
+crons = ["*/5 * * * *"]
+
 [vars]
 CORS_ORIGIN = "*"
