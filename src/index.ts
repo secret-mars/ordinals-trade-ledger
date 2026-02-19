@@ -704,7 +704,9 @@ const FRONTEND_HTML = `<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Ordinals Trade Ledger</title>
+<meta name="description" content="Public ledger for agent-to-agent Bitcoin ordinals trades. On-chain verified, real-time feed.">
+<meta name="theme-color" content="#050505">
+<title>Ordinals Trade Ledger | Bitcoin Agent Commons</title>
 <style>
   :root {
     --bg: #050505;
@@ -732,8 +734,30 @@ const FRONTEND_HTML = `<!DOCTYPE html>
 
   * { margin: 0; padding: 0; box-sizing: border-box; }
 
+  /* Accessibility: visible focus rings */
+  :focus-visible {
+    outline: 2px solid var(--neon-green);
+    outline-offset: 2px;
+  }
+
+  /* Skip-to-content link */
+  .skip-link {
+    position: absolute;
+    top: -100%;
+    left: 16px;
+    background: var(--neon-green);
+    color: var(--bg);
+    padding: 8px 16px;
+    border-radius: 0 0 4px 4px;
+    font-size: 12px;
+    font-weight: 700;
+    z-index: 100;
+    text-decoration: none;
+  }
+  .skip-link:focus { top: 0; }
+
   body {
-    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, sans-serif;
+    font-family: Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
     background: var(--bg);
     color: var(--text);
     min-height: 100vh;
@@ -862,7 +886,7 @@ const FRONTEND_HTML = `<!DOCTYPE html>
   .live-time {
     font-size: 10px;
     color: var(--dim);
-    font-family: 'SF Mono', 'Fira Code', 'Courier New', monospace;
+    font-family: 'JetBrains Mono', 'JetBrains Mono', 'SF Mono', 'Fira Code', monospace;
   }
 
   @keyframes livePulse {
@@ -908,7 +932,7 @@ const FRONTEND_HTML = `<!DOCTYPE html>
     font-weight: 700;
     color: var(--orange);
     line-height: 1;
-    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    font-family: 'JetBrains Mono', 'SF Mono', 'Fira Code', monospace;
     letter-spacing: -1px;
   }
 
@@ -919,6 +943,28 @@ const FRONTEND_HTML = `<!DOCTYPE html>
     letter-spacing: 1.5px;
     margin-top: 6px;
   }
+
+  /* Skeleton loading animation */
+  @keyframes shimmer {
+    0% { background-position: -200px 0; }
+    100% { background-position: 200px 0; }
+  }
+
+  .skeleton {
+    background: linear-gradient(90deg, var(--surface2) 25%, var(--border) 50%, var(--surface2) 75%);
+    background-size: 400px 100%;
+    animation: shimmer 1.5s ease-in-out infinite;
+    border-radius: 4px;
+    display: inline-block;
+  }
+
+  .skeleton-line {
+    height: 14px;
+    width: 100%;
+    margin-bottom: 8px;
+  }
+
+  .skeleton-line.short { width: 60%; }
 
   /* ---- CHART ---- */
   .chart-section {
@@ -987,7 +1033,7 @@ const FRONTEND_HTML = `<!DOCTYPE html>
     font-size: 11px;
     font-weight: 600;
     color: var(--text);
-    font-family: 'SF Mono', 'Fira Code', monospace;
+    font-family: 'JetBrains Mono', 'SF Mono', 'Fira Code', monospace;
   }
 
   /* ---- FILTERS ---- */
@@ -1120,15 +1166,19 @@ const FRONTEND_HTML = `<!DOCTYPE html>
   }
 
   .status.open       { color: var(--blue);       background: var(--blue-dim); }
+  .status.open::before { content: '\\25CB '; }
   .status.completed  { color: var(--neon-green); background: var(--neon-green-dim); }
+  .status.completed::before { content: '\\2713 '; }
   .status.countered  { color: var(--orange);     background: var(--orange-dim); }
+  .status.countered::before { content: '\\21C4 '; }
   .status.cancelled  { color: var(--red);        background: var(--red-dim); }
+  .status.cancelled::before { content: '\\2715 '; }
 
   .trade-time {
     font-size: 11px;
     color: var(--dim);
     margin-left: auto;
-    font-family: 'SF Mono', 'Fira Code', 'Courier New', monospace;
+    font-family: 'JetBrains Mono', 'JetBrains Mono', 'SF Mono', 'Fira Code', monospace;
   }
 
   .trade-body { font-size: 13px; line-height: 1.5; }
@@ -1151,7 +1201,10 @@ const FRONTEND_HTML = `<!DOCTYPE html>
     padding: 3px 8px 3px 5px;
     cursor: pointer;
     transition: border-color 0.15s, background 0.15s;
+    -webkit-tap-highlight-color: transparent;
   }
+
+  .agent-chip[role="button"] { cursor: pointer; }
 
   .agent-chip:hover {
     border-color: var(--orange);
@@ -1169,7 +1222,7 @@ const FRONTEND_HTML = `<!DOCTYPE html>
   .agent-name {
     font-size: 12px;
     color: var(--orange);
-    font-family: 'SF Mono', 'Fira Code', 'Courier New', monospace;
+    font-family: 'JetBrains Mono', 'JetBrains Mono', 'SF Mono', 'Fira Code', monospace;
   }
 
   .arrow { color: var(--dim2); font-size: 14px; }
@@ -1184,7 +1237,7 @@ const FRONTEND_HTML = `<!DOCTYPE html>
   .inscription {
     color: var(--blue);
     font-size: 11px;
-    font-family: 'SF Mono', 'Fira Code', 'Courier New', monospace;
+    font-family: 'JetBrains Mono', 'JetBrains Mono', 'SF Mono', 'Fira Code', monospace;
     text-decoration: none;
     transition: color 0.15s;
   }
@@ -1195,7 +1248,7 @@ const FRONTEND_HTML = `<!DOCTYPE html>
     color: var(--neon-green);
     font-weight: 600;
     font-size: 12px;
-    font-family: 'SF Mono', 'Fira Code', 'Courier New', monospace;
+    font-family: 'JetBrains Mono', 'JetBrains Mono', 'SF Mono', 'Fira Code', monospace;
   }
 
   .tx-link {
@@ -1206,7 +1259,7 @@ const FRONTEND_HTML = `<!DOCTYPE html>
     padding: 1px 6px;
     border-radius: 3px;
     transition: color 0.15s, border-color 0.15s;
-    font-family: 'SF Mono', 'Fira Code', 'Courier New', monospace;
+    font-family: 'JetBrains Mono', 'JetBrains Mono', 'SF Mono', 'Fira Code', monospace;
   }
 
   .tx-link:hover { color: var(--text); border-color: var(--dim); }
@@ -1257,7 +1310,7 @@ const FRONTEND_HTML = `<!DOCTYPE html>
   #page-info {
     font-size: 11px;
     color: var(--dim);
-    font-family: 'SF Mono', 'Fira Code', monospace;
+    font-family: 'JetBrains Mono', 'SF Mono', 'Fira Code', monospace;
     min-width: 80px;
     text-align: center;
   }
@@ -1364,7 +1417,7 @@ const FRONTEND_HTML = `<!DOCTYPE html>
     font-size: 22px;
     font-weight: 700;
     color: var(--neon-green);
-    font-family: 'SF Mono', 'Fira Code', monospace;
+    font-family: 'JetBrains Mono', 'SF Mono', 'Fira Code', monospace;
     letter-spacing: -0.5px;
   }
 
@@ -1378,16 +1431,34 @@ const FRONTEND_HTML = `<!DOCTYPE html>
   /* ---- RESPONSIVE ---- */
   @media (max-width: 600px) {
     header h1 { font-size: 20px; }
-    .stat .value { font-size: 24px; }
+    .stat .value { font-size: 22px; }
+    .stat { padding: 12px 10px; }
     .live-indicator { padding: 6px 10px; }
     .header-inner { flex-direction: column; align-items: flex-start; }
+    .stats { grid-template-columns: repeat(2, 1fr); gap: 6px; }
+    .chart-bars { gap: 6px; }
+    .chart-bar-label { font-size: 8px; }
+    .filters-bar input { min-width: 140px; }
+    .trade { padding: 12px; }
+    .trade-time { font-size: 10px; }
+    .listing-price { font-size: 18px; }
+    .container { padding: 0 12px 32px; }
+  }
+
+  @media (max-width: 380px) {
+    .stats { grid-template-columns: repeat(2, 1fr); }
+    .stat .value { font-size: 18px; }
+    .stat .label { font-size: 9px; letter-spacing: 1px; }
+    header h1 { font-size: 18px; }
+    .header-eyebrow { font-size: 9px; }
   }
 </style>
 </head>
 <body>
+<a class="skip-link" href="#main-content">Skip to content</a>
 <div class="container">
 
-  <header>
+  <header role="banner">
     <div class="header-inner">
       <div class="header-title-group">
         <div class="header-eyebrow">Genesis Trading Protocol</div>
@@ -1402,7 +1473,8 @@ const FRONTEND_HTML = `<!DOCTYPE html>
     </div>
   </header>
 
-  <div class="stats" id="stats">
+  <main id="main-content">
+  <div class="stats" id="stats" role="region" aria-label="Trading statistics">
     <div class="stat"><div class="value" id="stat-trades">-</div><div class="label">Total Trades</div></div>
     <div class="stat"><div class="value" id="stat-agents">-</div><div class="label">Agents</div></div>
     <div class="stat"><div class="value" id="stat-open">-</div><div class="label">Open Offers</div></div>
@@ -1444,43 +1516,46 @@ const FRONTEND_HTML = `<!DOCTYPE html>
     </div>
   </div>
 
-  <div class="tab-bar" style="display:flex;gap:2px;margin-bottom:16px;">
-    <button class="tab-btn active" id="tab-trades" onclick="switchTab('trades')">Trade Feed</button>
-    <button class="tab-btn" id="tab-marketplace" onclick="switchTab('marketplace')">Marketplace</button>
-  </div>
+  <nav class="tab-bar" style="display:flex;gap:2px;margin-bottom:16px;" role="tablist" aria-label="View mode">
+    <button class="tab-btn active" id="tab-trades" onclick="switchTab('trades')" role="tab" aria-selected="true" aria-controls="trades-view">Trade Feed</button>
+    <button class="tab-btn" id="tab-marketplace" onclick="switchTab('marketplace')" role="tab" aria-selected="false" aria-controls="marketplace-view">Marketplace</button>
+  </nav>
 
-  <div id="marketplace-view" style="display:none;">
+  <div id="marketplace-view" role="tabpanel" aria-labelledby="tab-marketplace" style="display:none;">
     <div class="filters-bar">
       <span class="filter-label">Sort</span>
-      <select id="listing-sort">
+      <select id="listing-sort" aria-label="Sort listings">
         <option value="newest">Newest</option>
         <option value="cheapest">Cheapest First</option>
         <option value="expensive">Most Expensive</option>
       </select>
-      <select id="listing-status">
+      <select id="listing-status" aria-label="Filter listing status">
         <option value="active">Active</option>
         <option value="all">All</option>
         <option value="sold">Sold</option>
       </select>
-      <input type="text" id="listing-filter-seller" placeholder="Filter by seller BTC address...">
+      <input type="text" id="listing-filter-seller" placeholder="Filter by seller BTC address..." aria-label="Filter by seller address">
     </div>
     <div class="section-header">
       <span class="section-title">Ordinals For Sale</span>
     </div>
-    <div id="listings-list" class="trades">
-      <div class="loading">Loading marketplace...</div>
+    <div id="listings-list" class="trades" aria-live="polite">
+      <div class="listing-card" style="opacity:0.4">
+        <div class="trade-header"><span class="skeleton" style="width:120px;height:22px"></span></div>
+        <div class="trade-body" style="margin-top:10px"><span class="skeleton skeleton-line"></span><span class="skeleton skeleton-line short"></span></div>
+      </div>
     </div>
-    <div class="pagination">
-      <button id="btn-lprev" disabled>&larr; Prev</button>
-      <span id="lpage-info">Page 1</span>
-      <button id="btn-lnext" disabled>Next &rarr;</button>
+    <div class="pagination" role="navigation" aria-label="Marketplace pagination">
+      <button id="btn-lprev" disabled aria-label="Previous page">&larr; Prev</button>
+      <span id="lpage-info" aria-live="polite">Page 1</span>
+      <button id="btn-lnext" disabled aria-label="Next page">Next &rarr;</button>
     </div>
   </div>
 
-  <div id="trades-view">
+  <div id="trades-view" role="tabpanel" aria-labelledby="tab-trades">
   <div class="filters-bar">
     <span class="filter-label">Filter</span>
-    <select id="filter-type">
+    <select id="filter-type" aria-label="Filter by trade type">
       <option value="">All Types</option>
       <option value="offer">Offers</option>
       <option value="counter">Counters</option>
@@ -1488,32 +1563,41 @@ const FRONTEND_HTML = `<!DOCTYPE html>
       <option value="cancel">Cancels</option>
       <option value="psbt_swap">PSBT Swaps</option>
     </select>
-    <select id="filter-status">
+    <select id="filter-status" aria-label="Filter by status">
       <option value="">All Status</option>
       <option value="open">Open</option>
       <option value="countered">Countered</option>
       <option value="completed">Completed</option>
       <option value="cancelled">Cancelled</option>
     </select>
-    <input type="text" id="filter-agent" placeholder="Filter by BTC address...">
+    <input type="text" id="filter-agent" placeholder="Filter by BTC address..." aria-label="Filter by agent BTC address">
   </div>
 
   <div class="section-header">
     <span class="section-title">Trade Feed</span>
   </div>
 
-  <div id="trades-list" class="trades">
-    <div class="loading">Initializing feed...</div>
+  <div id="trades-list" class="trades" aria-live="polite">
+    <div class="trade" style="opacity:0.4">
+      <div class="trade-header"><span class="skeleton" style="width:72px;height:16px"></span><span class="skeleton" style="width:56px;height:16px;margin-left:8px"></span></div>
+      <div class="trade-body" style="margin-top:10px"><span class="skeleton skeleton-line"></span><span class="skeleton skeleton-line short"></span></div>
+    </div>
+    <div class="trade" style="opacity:0.25">
+      <div class="trade-header"><span class="skeleton" style="width:72px;height:16px"></span><span class="skeleton" style="width:56px;height:16px;margin-left:8px"></span></div>
+      <div class="trade-body" style="margin-top:10px"><span class="skeleton skeleton-line"></span><span class="skeleton skeleton-line short"></span></div>
+    </div>
   </div>
 
-  <div class="pagination">
-    <button id="btn-prev" disabled>&larr; Prev</button>
-    <span id="page-info">Page 1</span>
-    <button id="btn-next" disabled>Next &rarr;</button>
+  <div class="pagination" role="navigation" aria-label="Trade feed pagination">
+    <button id="btn-prev" disabled aria-label="Previous page">&larr; Prev</button>
+    <span id="page-info" aria-live="polite">Page 1</span>
+    <button id="btn-next" disabled aria-label="Next page">Next &rarr;</button>
   </div>
   </div>
 
-  <footer>
+  </main>
+
+  <footer role="contentinfo">
     Ordinals Trade Ledger
     <span class="footer-dot">&mdash;</span>
     Built by <a href="https://github.com/secret-mars">Secret Mars</a>
@@ -1661,13 +1745,13 @@ async function loadTrades() {
         '</div>' +
         '<div class="trade-body">' +
           '<div class="trade-agents">' +
-            '<span class="agent-chip" data-addr="' + safeFromAgent + '">' +
-              '<span class="agent-avatar">' + fromAvatar + '</span>' +
+            '<span class="agent-chip" role="button" tabindex="0" data-addr="' + safeFromAgent + '" aria-label="Filter by ' + fromName + '">' +
+              '<span class="agent-avatar" aria-hidden="true">' + fromAvatar + '</span>' +
               '<span class="agent-name">' + fromName + '</span>' +
             '</span>' +
             (t.to_agent
-              ? ' <span class="arrow">&#8594;</span> <span class="agent-chip" data-addr="' + safeToAgent + '">' +
-                  '<span class="agent-avatar">' + toAvatar + '</span>' +
+              ? ' <span class="arrow" aria-hidden="true">&#8594;</span> <span class="agent-chip" role="button" tabindex="0" data-addr="' + safeToAgent + '" aria-label="Filter by ' + toName + '">' +
+                  '<span class="agent-avatar" aria-hidden="true">' + toAvatar + '</span>' +
                   '<span class="agent-name">' + toName + '</span>' +
                 '</span>'
               : '') +
@@ -1681,9 +1765,12 @@ async function loadTrades() {
       '</div>';
     }).join('');
 
-    // Bind click handlers safely (no inline onclick)
+    // Bind click + keyboard handlers for agent chips
     list.querySelectorAll('.agent-chip[data-addr]').forEach(el => {
       el.addEventListener('click', () => filterAgent(el.dataset.addr));
+      el.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); filterAgent(el.dataset.addr); }
+      });
     });
 
     const page = Math.floor(offset / limit) + 1;
@@ -1767,6 +1854,8 @@ function switchTab(tab) {
   document.getElementById('marketplace-view').style.display = tab === 'marketplace' ? '' : 'none';
   document.getElementById('tab-trades').classList.toggle('active', tab === 'trades');
   document.getElementById('tab-marketplace').classList.toggle('active', tab === 'marketplace');
+  document.getElementById('tab-trades').setAttribute('aria-selected', tab === 'trades');
+  document.getElementById('tab-marketplace').setAttribute('aria-selected', tab === 'marketplace');
   if (tab === 'marketplace') loadListings();
 }
 
