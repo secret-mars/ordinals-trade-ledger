@@ -718,6 +718,11 @@ export default {
           return json({ error: 'Invalid signature format' }, 401, origin);
         }
 
+        // Cryptographic BIP-137 verification
+        const taprootMsg = `ordinals-ledger | taproot | ${body.btc_address} | ${body.taproot_address} | ${body.timestamp}`;
+        const taprootSigErr = await verifyBip137(body.signature, taprootMsg, body.btc_address);
+        if (taprootSigErr) return json({ error: taprootSigErr }, 401, origin);
+
         // Check agent exists
         const agent = await env.DB
           .prepare('SELECT btc_address FROM agents WHERE btc_address = ?')
@@ -953,6 +958,11 @@ export default {
           return json({ error: 'Invalid signature format' }, 401, origin);
         }
 
+        // Cryptographic BIP-137 verification
+        const delistMsg = `ordinals-ledger | delist | ${body.seller_btc_address} | ${id} | ${body.timestamp}`;
+        const delistSigErr = await verifyBip137(body.signature, delistMsg, body.seller_btc_address);
+        if (delistSigErr) return json({ error: delistSigErr }, 401, origin);
+
         // Verify listing exists and seller matches
         const listing = await env.DB
           .prepare("SELECT * FROM listings WHERE id = ? AND status = 'active'")
@@ -987,7 +997,8 @@ export default {
 
     return json({ error: 'Not found' }, 404, origin);
     } catch (e: any) {
-      return json({ error: 'Internal server error', detail: e?.message }, 500, origin);
+      console.error('Unhandled error:', e?.message);
+      return json({ error: 'Internal server error' }, 500, origin);
     }
   },
 
@@ -2123,7 +2134,7 @@ async function loadTrades() {
           '<div class="trade-narrative">' + narrative + '</div>' +
           '<div class="inscription-preview">' +
             '<a href="https://ordinals.com/inscription/' + encodeURIComponent(t.inscription_id) + '" target="_blank" rel="noopener">' +
-              '<iframe src="https://ordinals.com/preview/' + encodeURIComponent(t.inscription_id) + '" sandbox="allow-scripts allow-same-origin" loading="lazy" title="Inscription preview"></iframe>' +
+              '<iframe src="https://ordinals.com/preview/' + encodeURIComponent(t.inscription_id) + '" sandbox="allow-scripts" loading="lazy" title="Inscription preview"></iframe>' +
             '</a>' +
           '</div>' +
           '<div class="trade-meta">' +
@@ -2280,7 +2291,7 @@ async function loadListings() {
           '</div>' +
           '<div class="inscription-preview">' +
             '<a href="https://ordinals.com/inscription/' + encodeURIComponent(l.inscription_id) + '" target="_blank" rel="noopener">' +
-              '<iframe src="https://ordinals.com/preview/' + encodeURIComponent(l.inscription_id) + '" sandbox="allow-scripts allow-same-origin" loading="lazy" title="Inscription preview"></iframe>' +
+              '<iframe src="https://ordinals.com/preview/' + encodeURIComponent(l.inscription_id) + '" sandbox="allow-scripts" loading="lazy" title="Inscription preview"></iframe>' +
             '</a>' +
           '</div>' +
           '<div class="trade-meta">' +
