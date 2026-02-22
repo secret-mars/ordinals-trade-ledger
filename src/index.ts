@@ -590,10 +590,13 @@ export default {
         const authErr = await validateAuth(body as any);
         if (authErr) return json({ error: authErr }, 401, origin);
 
-        // Validate amount_sats if provided — must be a non-negative integer
+        // Validate amount_sats if provided — must be a non-negative integer within BTC supply
         if (body.amount_sats !== undefined && body.amount_sats !== null) {
           if (!Number.isInteger(body.amount_sats) || body.amount_sats < 0) {
             return json({ error: 'amount_sats must be a non-negative integer' }, 400, origin);
+          }
+          if (body.amount_sats > 2_100_000_000_000_000) {
+            return json({ error: 'amount_sats exceeds maximum (21M BTC)' }, 400, origin);
           }
         }
 
@@ -798,12 +801,16 @@ export default {
       }
     }
 
-    // GET /api/agents — List all agents
+    // GET /api/agents — List all agents (paginated)
     if (request.method === 'GET' && path === '/api/agents') {
+      const limit = Math.min(Math.max(parseInt(url.searchParams.get('limit') || '50'), 1), 100);
+      const offset = Math.max(parseInt(url.searchParams.get('offset') || '0'), 0);
       const agents = await env.DB
-        .prepare('SELECT * FROM agents ORDER BY trade_count DESC')
+        .prepare('SELECT * FROM agents ORDER BY trade_count DESC LIMIT ? OFFSET ?')
+        .bind(limit, offset)
         .all();
-      return json({ agents: agents.results }, 200, origin);
+      const total = await env.DB.prepare('SELECT COUNT(*) as count FROM agents').first<{ count: number }>();
+      return json({ agents: agents.results, pagination: { limit, offset, total: total?.count || 0 } }, 200, origin);
     }
 
     // GET /api/stats — Ledger statistics
@@ -884,8 +891,11 @@ export default {
           return json({ error: `description exceeds ${MAX_DESCRIPTION} chars` }, 400, origin);
         }
 
-        if (typeof body.price_floor_sats !== 'number' || body.price_floor_sats <= 0) {
-          return json({ error: 'price_floor_sats must be a positive number' }, 400, origin);
+        if (typeof body.price_floor_sats !== 'number' || !Number.isInteger(body.price_floor_sats) || body.price_floor_sats <= 0) {
+          return json({ error: 'price_floor_sats must be a positive integer' }, 400, origin);
+        }
+        if (body.price_floor_sats > 2_100_000_000_000_000) {
+          return json({ error: 'price_floor_sats exceeds maximum (21M BTC)' }, 400, origin);
         }
 
         // Auth: seller must sign
