@@ -13,5 +13,9 @@
   "devDependencies": {
     "@cloudflare/workers-types": "^4.20241205.0",
     "wrangler": "^4.65.0"
+  },
+  "dependencies": {
+    "@noble/hashes": "^1.8.0",
+    "@noble/secp256k1": "^2.3.0"
   }
 }

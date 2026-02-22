@@ -2,6 +2,10 @@
 // Tracks all agent-to-agent ordinals trades: offers, counters, transfers
 // Public ledger UI for the genesis trading protocol
 
+import * as secp from '@noble/secp256k1';
+import { sha256 } from '@noble/hashes/sha256';
+import { ripemd160 } from '@noble/hashes/ripemd160';
+
 interface Env {
   DB: D1Database;
   CORS_ORIGIN: string;
@@ -61,10 +65,106 @@ const MAX_DISPLAY_NAME = 50;
 const MAX_DESCRIPTION = 500;
 const MAX_METADATA = 1000;
 
+// --- BIP-137 Signature Verification ---
+
+function encodeVarint(n: number): Uint8Array {
+  if (n < 0xfd) return new Uint8Array([n]);
+  if (n <= 0xffff) { const b = new Uint8Array(3); b[0] = 0xfd; b[1] = n & 0xff; b[2] = (n >> 8) & 0xff; return b; }
+  const b = new Uint8Array(5); b[0] = 0xfe; for (let i = 0; i < 4; i++) b[1 + i] = (n >> (8 * i)) & 0xff; return b;
+}
+
+function bitcoinMessageHash(message: string): Uint8Array {
+  const prefix = '\x18Bitcoin Signed Message:\n';
+  const prefixBytes = new TextEncoder().encode(prefix);
+  const msgBytes = new TextEncoder().encode(message);
+  const msgLen = encodeVarint(msgBytes.length);
+  const buf = new Uint8Array(prefixBytes.length + msgLen.length + msgBytes.length);
+  buf.set(prefixBytes, 0);
+  buf.set(msgLen, prefixBytes.length);
+  buf.set(msgBytes, prefixBytes.length + msgLen.length);
+  return sha256(sha256(buf));
+}
+
+function bech32Polymod(values: number[]): number {
+  const GEN = [0x3b6a57b2, 0x26508e6d, 0x1ea119fa, 0x3d4233dd, 0x2a1462b3];
+  let chk = 1;
+  for (const v of values) {
+    const b = chk >> 25;
+    chk = ((chk & 0x1ffffff) << 5) ^ v;
+    for (let i = 0; i < 5; i++) if ((b >> i) & 1) chk ^= GEN[i];
+  }
+  return chk;
+}
+
+function bech32Encode(hrp: string, data: number[]): string {
+  const CHARSET = 'qpzry9x8gf2tvdw0s3jn54khce6mua7l';
+  const expand = [...Array.from(hrp, c => c.charCodeAt(0) >> 5), 0, ...Array.from(hrp, c => c.charCodeAt(0) & 31)];
+  const values = [...expand, ...data, 0, 0, 0, 0, 0, 0];
+  const polymod = bech32Polymod(values) ^ 1;
+  const checksum = Array.from({ length: 6 }, (_, i) => (polymod >> (5 * (5 - i))) & 31);
+  return hrp + '1' + [...data, ...checksum].map(d => CHARSET[d]).join('');
+}
+
+function convertBits(data: Uint8Array, fromBits: number, toBits: number, pad: boolean): number[] {
+  let acc = 0, bits = 0;
+  const ret: number[] = [];
+  const maxv = (1 << toBits) - 1;
+  for (const value of data) {
+    acc = (acc << fromBits) | value;
+    bits += fromBits;
+    while (bits >= toBits) { bits -= toBits; ret.push((acc >> bits) & maxv); }
+  }
+  if (pad && bits > 0) ret.push((acc << (toBits - bits)) & maxv);
+  return ret;
+}
+
+function pubkeyToBech32(pubkey: Uint8Array): string {
+  const hash = ripemd160(sha256(pubkey));
+  const words = [0, ...convertBits(hash, 8, 5, true)];
+  return bech32Encode('bc', words);
+}
+
+async function verifyBip137(signature: string, message: string, expectedAddress: string): Promise<string | null> {
+  let sigBytes: Uint8Array;
+  try {
+    sigBytes = Uint8Array.from(atob(signature), c => c.charCodeAt(0));
+  } catch { return 'Invalid signature: not valid base64'; }
+
+  if (sigBytes.length !== 65) return `Invalid signature: expected 65 bytes, got ${sigBytes.length}`;
+
+  const header = sigBytes[0];
+  if (header < 27 || header > 42) return `Invalid signature header byte: ${header}`;
+
+  const recoveryId = (header - 27) & 3;
+  const compressed = header >= 31;
+
+  const r = sigBytes.slice(1, 33);
+  const s = sigBytes.slice(33, 65);
+  const sig = new secp.Signature(
+    BigInt('0x' + Array.from(r, b => b.toString(16).padStart(2, '0')).join('')),
+    BigInt('0x' + Array.from(s, b => b.toString(16).padStart(2, '0')).join(''))
+  ).addRecoveryBit(recoveryId);
+
+  const msgHash = bitcoinMessageHash(message);
+
+  let pubkey: Uint8Array;
+  try {
+    const point = sig.recoverPublicKey(msgHash);
+    pubkey = point.toRawBytes(compressed);
+  } catch { return 'Signature recovery failed: invalid signature for this message'; }
+
+  const derivedAddress = pubkeyToBech32(pubkey);
+  if (derivedAddress !== expectedAddress) {
+    return `Signature mismatch: recovered ${derivedAddress}, expected ${expectedAddress}`;
+  }
+
+  return null; // verified
+}
+
 // Auth: require BIP-137 signature on all write endpoints
 // Signature message format: "ordinals-ledger | {type} | {from_agent} | {inscription_id} | {timestamp}"
 // Timestamp must be within 300 seconds of server time
-function validateAuth(body: any): string | null {
+async function validateAuth(body: any): Promise<string | null> {
   if (!body.from_agent) return 'Required: from_agent';
   if (!isValidBtcAddress(body.from_agent)) return 'Invalid from_agent: must be a valid Bitcoin address';
   if (body.to_agent && !isValidBtcAddress(body.to_agent)) return 'Invalid to_agent: must be a valid Bitcoin address';
@@ -100,6 +200,11 @@ function validateAuth(body: any): string | null {
   if (body.type === 'psbt_swap' && !body.to_agent) {
     return 'PSBT swaps require to_agent (the counterparty)';
   }
+
+  // Cryptographic BIP-137 signature verification
+  const expectedMessage = `ordinals-ledger | ${body.type} | ${body.from_agent} | ${body.inscription_id || ''} | ${body.timestamp}`;
+  const sigErr = await verifyBip137(body.signature, expectedMessage, body.from_agent);
+  if (sigErr) return sigErr;
 
   return null;
 }
@@ -430,7 +535,7 @@ export default {
           return json({ error: 'Invalid type. Must be: offer, counter, transfer, cancel, psbt_swap' }, 400, origin);
         }
 
-        const authErr = validateAuth(body as any);
+        const authErr = await validateAuth(body as any);
         if (authErr) return json({ error: authErr }, 401, origin);
 
         // Validate amount_sats if provided — must be a non-negative integer
@@ -739,6 +844,11 @@ export default {
         if (typeof body.signature !== 'string' || body.signature.length < 80 || body.signature.length > 100) {
           return json({ error: 'Invalid signature format' }, 401, origin);
         }
+
+        // Cryptographic BIP-137 verification for listings
+        const listingMsg = `ordinals-ledger | listing | ${body.seller_btc_address} | ${body.inscription_id} | ${body.timestamp}`;
+        const listingSigErr = await verifyBip137(body.signature, listingMsg, body.seller_btc_address);
+        if (listingSigErr) return json({ error: listingSigErr }, 401, origin);
 
         // Check no active listing for same inscription by same seller
         const existing = await env.DB
