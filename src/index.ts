@@ -6,6 +6,7 @@ interface Env {
   DB: D1Database;
   CORS_ORIGIN: string;
   HIRO_API_KEY?: string;
+  UNISAT_API_KEY?: string;
 }
 
 interface TradeInput {
@@ -72,15 +73,16 @@ function validateAuth(body: any): string | null {
   return null;
 }
 
-async function ensureAgent(db: D1Database, btcAddress: string, displayName?: string, stxAddress?: string) {
+async function ensureAgent(db: D1Database, btcAddress: string, displayName?: string, stxAddress?: string, taprootAddress?: string) {
   await db
     .prepare(
-      `INSERT INTO agents (btc_address, display_name, stx_address) VALUES (?, ?, ?)
+      `INSERT INTO agents (btc_address, display_name, stx_address, taproot_address) VALUES (?, ?, ?, ?)
        ON CONFLICT(btc_address) DO UPDATE SET
-         display_name = COALESCE(excluded.display_name, agents.display_name),
-         stx_address = COALESCE(excluded.stx_address, agents.stx_address)`
+         display_name = COALESCE(agents.display_name, excluded.display_name),
+         stx_address = COALESCE(excluded.stx_address, agents.stx_address),
+         taproot_address = COALESCE(excluded.taproot_address, agents.taproot_address)`
     )
-    .bind(btcAddress, displayName || null, stxAddress || null)
+    .bind(btcAddress, displayName || null, stxAddress || null, taprootAddress || null)
     .run();
 }
 
@@ -93,16 +95,21 @@ interface InscriptionResult {
   content_type: string;
 }
 
-async function fetchAgentInscriptions(address: string, _apiKey?: string): Promise<InscriptionResult[]> {
+async function fetchAgentInscriptions(address: string, unisatApiKey?: string): Promise<InscriptionResult[]> {
   // Uses Unisat open API — Hiro's ordinals index misses recent inscriptions
   const all: InscriptionResult[] = [];
   const perPage = 100;
   const maxPages = 3; // cap at 300 inscriptions per agent
   let cursor = 0;
 
+  const headers: Record<string, string> = { 'Accept': 'application/json' };
+  if (unisatApiKey) {
+    headers['Authorization'] = `Bearer ${unisatApiKey}`;
+  }
+
   for (let page = 0; page < maxPages; page++) {
     const url = `https://open-api.unisat.io/v1/indexer/address/${encodeURIComponent(address)}/inscription-data?cursor=${cursor}&size=${perPage}`;
-    const resp = await fetch(url, { headers: { 'Accept': 'application/json' } });
+    const resp = await fetch(url, { headers });
     if (!resp.ok) {
       throw new Error(`Unisat API ${resp.status}: ${resp.statusText}`);
     }
@@ -148,11 +155,29 @@ function sleep(ms: number): Promise<void> {
 }
 
 async function findPreviousHolder(db: D1Database, inscriptionId: string, currentHolder: string): Promise<string | null> {
-  const row = await db
+  // Look up all addresses belonging to the current holder (btc + taproot)
+  const self = await db
+    .prepare('SELECT btc_address, taproot_address FROM agents WHERE btc_address = ? OR taproot_address = ?')
+    .bind(currentHolder, currentHolder)
+    .first<{ btc_address: string; taproot_address: string | null }>();
+  const ownAddresses = new Set([currentHolder]);
+  if (self) {
+    ownAddresses.add(self.btc_address);
+    if (self.taproot_address) ownAddresses.add(self.taproot_address);
+  }
+
+  const rows = await db
     .prepare('SELECT btc_address FROM agent_inscriptions WHERE inscription_id = ? AND btc_address != ?')
     .bind(inscriptionId, currentHolder)
-    .first<{ btc_address: string }>();
-  return row?.btc_address || null;
+    .all<{ btc_address: string }>();
+
+  // Skip any address that belongs to the same agent
+  for (const row of rows.results) {
+    if (!ownAddresses.has(row.btc_address)) {
+      return row.btc_address;
+    }
+  }
+  return null;
 }
 
 async function syncAgentsFromAibtc(db: D1Database): Promise<number> {
@@ -177,9 +202,8 @@ async function syncAgentsFromAibtc(db: D1Database): Promise<number> {
         .prepare(
           `INSERT INTO agents (btc_address, display_name, stx_address) VALUES (?, ?, ?)
            ON CONFLICT(btc_address) DO UPDATE SET
-             display_name = COALESCE(excluded.display_name, agents.display_name),
-             stx_address = COALESCE(excluded.stx_address, agents.stx_address)`
-        )
+             display_name = COALESCE(agents.display_name, excluded.display_name),
+             stx_address = COALESCE(excluded.stx_address, agents.stx_address)`)
         .bind(a.btcAddress, a.displayName || a.bnsName || null, a.stxAddress || null)
         .run();
       synced++;
@@ -194,6 +218,7 @@ async function syncAgentsFromAibtc(db: D1Database): Promise<number> {
 
 async function runWatcher(env: Env): Promise<void> {
   const db = env.DB;
+  const BATCH_SIZE = 15; // Reduced: agents with taproot use 2 API calls each (50 subrequest limit)
 
   // Check for overlap — skip if a run is still in progress
   const inProgress = await db
@@ -212,22 +237,57 @@ async function runWatcher(env: Env): Promise<void> {
   const errors: string[] = [];
 
   try {
-    // Sync all registered agents from AIBTC directory
-    try {
-      await syncAgentsFromAibtc(db);
-    } catch (syncErr: any) {
-      errors.push(`aibtc sync: ${syncErr.message}`);
+    // Sync agents from AIBTC every 6th run (~30 min) to save subrequests
+    const runCount = await db.prepare('SELECT COUNT(*) as c FROM watcher_runs').first<{ c: number }>();
+    if ((runCount?.c || 0) % 6 === 1) {
+      try {
+        await syncAgentsFromAibtc(db);
+      } catch (syncErr: any) {
+        errors.push(`aibtc sync: ${syncErr.message}`);
+      }
     }
 
-    const agents = await db.prepare('SELECT btc_address, display_name FROM agents').all<{ btc_address: string; display_name: string | null }>();
+    const agents = await db.prepare('SELECT btc_address, display_name, taproot_address FROM agents ORDER BY btc_address').all<{ btc_address: string; display_name: string | null; taproot_address: string | null }>();
 
-    for (const agent of agents.results) {
+    // Rotate through agents in batches — use run ID to pick the batch offset
+    const totalAgents = agents.results.length;
+    const batchOffset = ((runId as number) * BATCH_SIZE) % Math.max(totalAgents, 1);
+    const batch = [];
+    for (let i = 0; i < Math.min(BATCH_SIZE, totalAgents); i++) {
+      batch.push(agents.results[(batchOffset + i) % totalAgents]);
+    }
+
+    for (const agent of batch) {
       try {
         agentsChecked++;
-        const currentInscriptions = await fetchAgentInscriptions(agent.btc_address, env.HIRO_API_KEY);
-        const currentIds = new Set(currentInscriptions.map(i => i.id));
 
-        // Get previous snapshot
+        // Scan both SegWit and taproot addresses for this agent
+        const addressesToScan: string[] = [agent.btc_address];
+        if (agent.taproot_address) {
+          addressesToScan.push(agent.taproot_address);
+        }
+
+        // Fetch inscriptions from all addresses, deduplicated
+        const allInscriptions: InscriptionResult[] = [];
+        const seenIds = new Set<string>();
+
+        for (const addr of addressesToScan) {
+          const inscriptions = await fetchAgentInscriptions(addr, env.UNISAT_API_KEY);
+          for (const insc of inscriptions) {
+            if (!seenIds.has(insc.id)) {
+              seenIds.add(insc.id);
+              allInscriptions.push(insc);
+            }
+          }
+          // Rate limit between address scans
+          if (addressesToScan.length > 1 && addr !== addressesToScan[addressesToScan.length - 1]) {
+            await sleep(300);
+          }
+        }
+
+        const currentIds = new Set(allInscriptions.map(i => i.id));
+
+        // Get previous snapshot (stored under primary btc_address)
         const snapshot = await db
           .prepare('SELECT inscription_id FROM agent_inscriptions WHERE btc_address = ?')
           .bind(agent.btc_address)
@@ -235,7 +295,7 @@ async function runWatcher(env: Env): Promise<void> {
         const previousIds = new Set(snapshot.results.map(r => r.inscription_id));
 
         // New inscriptions = incoming transfers
-        for (const insc of currentInscriptions) {
+        for (const insc of allInscriptions) {
           if (!previousIds.has(insc.id)) {
             // Check dedup: no matching trade in last 24h for this inscription+agent
             const existing = await db
@@ -266,7 +326,7 @@ async function runWatcher(env: Env): Promise<void> {
               }
             }
 
-            // Add to snapshot
+            // Add to snapshot under primary btc_address (unified per agent)
             await db
               .prepare('INSERT OR IGNORE INTO agent_inscriptions (btc_address, inscription_id) VALUES (?, ?)')
               .bind(agent.btc_address, insc.id)
@@ -288,7 +348,7 @@ async function runWatcher(env: Env): Promise<void> {
       }
 
       // Rate limit courtesy — 500ms between agents
-      if (agents.results.indexOf(agent) < agents.results.length - 1) {
+      if (batch.indexOf(agent) < batch.length - 1) {
         await sleep(500);
       }
     }
@@ -308,13 +368,17 @@ async function runWatcher(env: Env): Promise<void> {
       .bind(agentsChecked, transfersFound, e.message, runId)
       .run();
   }
+
+  // Cleanup: keep only the 100 most recent watcher_runs to prevent unbounded table growth
+  await db.prepare("DELETE FROM watcher_runs WHERE id NOT IN (SELECT id FROM watcher_runs ORDER BY id DESC LIMIT 100)").run();
 }
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
+    const origin = env.CORS_ORIGIN || '*';
+    try {
     const url = new URL(request.url);
     const path = url.pathname;
-    const origin = env.CORS_ORIGIN || '*';
 
     if (request.method === 'OPTIONS') {
       return new Response(null, { status: 204, headers: corsHeaders(origin) });
@@ -338,6 +402,13 @@ export default {
         const authErr = validateAuth(body as any);
         if (authErr) return json({ error: authErr }, 401, origin);
 
+        // Validate amount_sats if provided — must be a non-negative integer
+        if (body.amount_sats !== undefined && body.amount_sats !== null) {
+          if (!Number.isInteger(body.amount_sats) || body.amount_sats < 0) {
+            return json({ error: 'amount_sats must be a non-negative integer' }, 400, origin);
+          }
+        }
+
         // Upsert agents
         await ensureAgent(env.DB, body.from_agent, body.from_display_name, body.from_stx_address);
         if (body.to_agent) {
@@ -359,15 +430,17 @@ export default {
           .bind(
             body.type,
             body.from_agent,
-            body.to_agent || null,
+            body.to_agent ?? null,
             body.inscription_id,
-            body.amount_sats || null,
+            body.amount_sats ?? null,
             status,
-            body.tx_hash || null,
-            body.parent_trade_id || null,
-            body.metadata || null
+            body.tx_hash ?? null,
+            body.parent_trade_id ?? null,
+            body.metadata ?? null
           )
           .run();
+
+        if (!result.success) return json({ error: 'Database write failed' }, 500, origin);
 
         // Update parent trade status if this is a counter/transfer/cancel
         if (body.parent_trade_id) {
@@ -454,7 +527,7 @@ export default {
 
     // GET /api/trades/:id — Get single trade
     if (request.method === 'GET' && path.match(/^\/api\/trades\/\d+$/)) {
-      const id = path.split('/').pop();
+      const id = parseInt(path.split('/').pop()!);
       const trade = await env.DB
         .prepare(`
           SELECT t.*, fa.display_name as from_name, ta.display_name as to_name
@@ -475,6 +548,61 @@ export default {
         .all();
 
       return json({ trade, related: related.results }, 200, origin);
+    }
+
+    // POST /api/agents/taproot — Register a taproot address for an agent
+    if (request.method === 'POST' && path === '/api/agents/taproot') {
+      try {
+        const body = await request.json() as {
+          btc_address?: string;
+          taproot_address?: string;
+          signature?: string;
+          timestamp?: string;
+        };
+
+        if (!body.btc_address || !body.taproot_address) {
+          return json({ error: 'Required: btc_address, taproot_address' }, 400, origin);
+        }
+
+        if (!body.taproot_address.startsWith('bc1p')) {
+          return json({ error: 'taproot_address must be a taproot address (bc1p...)' }, 400, origin);
+        }
+
+        // Auth: require BIP-137 signature
+        if (!body.signature || !body.timestamp) {
+          return json({ error: 'Required: signature (BIP-137), timestamp (ISO 8601)' }, 401, origin);
+        }
+
+        const ts = new Date(body.timestamp).getTime();
+        if (isNaN(ts) || Math.abs(Date.now() - ts) > 300_000) {
+          return json({ error: 'Timestamp expired or invalid (must be within 300s)' }, 401, origin);
+        }
+
+        if (typeof body.signature !== 'string' || body.signature.length < 80 || body.signature.length > 100) {
+          return json({ error: 'Invalid signature format' }, 401, origin);
+        }
+
+        // Check agent exists
+        const agent = await env.DB
+          .prepare('SELECT btc_address FROM agents WHERE btc_address = ?')
+          .bind(body.btc_address)
+          .first();
+
+        if (!agent) {
+          // Auto-create agent record
+          await ensureAgent(env.DB, body.btc_address);
+        }
+
+        // Update taproot address
+        await env.DB
+          .prepare('UPDATE agents SET taproot_address = ? WHERE btc_address = ?')
+          .bind(body.taproot_address, body.btc_address)
+          .run();
+
+        return json({ success: true, btc_address: body.btc_address, taproot_address: body.taproot_address }, 200, origin);
+      } catch (e: any) {
+        return json({ error: 'Internal server error' }, 500, origin);
+      }
     }
 
     // GET /api/agents — List all agents
@@ -522,11 +650,16 @@ export default {
         .prepare('SELECT COUNT(DISTINCT btc_address) as agents_tracked, COUNT(*) as total_inscriptions FROM agent_inscriptions')
         .first<{ agents_tracked: number; total_inscriptions: number }>();
 
+      const taprootStats = await env.DB
+        .prepare('SELECT COUNT(*) as agents_with_taproot FROM agents WHERE taproot_address IS NOT NULL')
+        .first<{ agents_with_taproot: number }>();
+
       return json({
         last_run: lastRun || null,
         snapshot: {
           agents_tracked: snapshotStats?.agents_tracked || 0,
           total_inscriptions: snapshotStats?.total_inscriptions || 0,
+          agents_with_taproot: taprootStats?.agents_with_taproot || 0,
         },
       }, 200, origin);
     }
@@ -580,6 +713,8 @@ export default {
           )
           .bind(body.inscription_id, body.seller_btc_address, body.price_floor_sats, body.description || null)
           .run();
+
+        if (!result.success) return json({ error: 'Database write failed' }, 500, origin);
 
         return json({ success: true, listing_id: result.meta.last_row_id }, 201, origin);
       } catch (e: any) {
@@ -691,6 +826,9 @@ export default {
     }
 
     return json({ error: 'Not found' }, 404, origin);
+    } catch (e: any) {
+      return json({ error: 'Internal server error', detail: e?.message }, 500, origin);
+    }
   },
 
   async scheduled(controller: ScheduledController, env: Env, ctx: ExecutionContext) {
@@ -1183,6 +1321,20 @@ const FRONTEND_HTML = `<!DOCTYPE html>
 
   .trade-body { font-size: 13px; line-height: 1.5; }
 
+  .trade-narrative {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    margin-bottom: 7px;
+    flex-wrap: wrap;
+    line-height: 1.8;
+  }
+
+  .narrative-text {
+    color: var(--dim);
+    font-size: 12px;
+  }
+
   .trade-agents {
     display: flex;
     align-items: center;
@@ -1227,6 +1379,41 @@ const FRONTEND_HTML = `<!DOCTYPE html>
 
   .arrow { color: var(--dim2); font-size: 14px; }
 
+  .inscription-preview {
+    width: 100%;
+    max-width: 280px;
+    aspect-ratio: 1;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    overflow: hidden;
+    margin-bottom: 10px;
+    background: #000;
+    position: relative;
+  }
+
+  .inscription-preview iframe {
+    width: 100%;
+    height: 100%;
+    border: none;
+    pointer-events: none;
+  }
+
+  .inscription-preview a {
+    display: block;
+    width: 100%;
+    height: 100%;
+  }
+
+  .inscription-preview:hover {
+    border-color: var(--orange);
+    box-shadow: 0 0 12px var(--orange-dim);
+  }
+
+  /* Marketplace listing uses larger preview */
+  .listing-card .inscription-preview {
+    max-width: 320px;
+  }
+
   .trade-meta {
     display: flex;
     align-items: center;
@@ -1245,11 +1432,15 @@ const FRONTEND_HTML = `<!DOCTYPE html>
   .inscription:hover { color: #55ccff; text-decoration: underline; }
 
   .amount {
-    color: var(--neon-green);
     font-weight: 600;
     font-size: 12px;
     font-family: 'JetBrains Mono', 'JetBrains Mono', 'SF Mono', 'Fira Code', monospace;
+    color: var(--neon-green);
   }
+  .amount.offer    { color: var(--blue); }
+  .amount.counter  { color: var(--orange); }
+  .amount.transfer { color: var(--neon-green); }
+  .amount.psbt_swap { color: var(--purple); }
 
   .tx-link {
     font-size: 10px;
@@ -1737,6 +1928,31 @@ async function loadTrades() {
       const toAvatar = makeAvatar(t.to_agent);
       const typeLabel = t.type === 'psbt_swap' ? 'PSBT Swap' : t.type;
 
+      // Build narrative line based on trade type
+      const fromChip = '<span class="agent-chip" role="button" tabindex="0" data-addr="' + safeFromAgent + '" aria-label="Filter by ' + fromName + '">' +
+        '<span class="agent-avatar" aria-hidden="true">' + fromAvatar + '</span>' +
+        '<span class="agent-name">' + fromName + '</span></span>';
+      const toChip = t.to_agent
+        ? '<span class="agent-chip" role="button" tabindex="0" data-addr="' + safeToAgent + '" aria-label="Filter by ' + toName + '">' +
+          '<span class="agent-avatar" aria-hidden="true">' + toAvatar + '</span>' +
+          '<span class="agent-name">' + toName + '</span></span>'
+        : '';
+      const amountStr = t.amount_sats ? '<span class="amount ' + esc(t.type) + '">' + formatSats(t.amount_sats) + '</span>' : '';
+      const inscLink = '<a class="inscription" href="https://ordinals.com/inscription/' + encodeURIComponent(t.inscription_id) + '" target="_blank" rel="noopener">' + inscriptionShort + '</a>';
+
+      let narrative = '';
+      if (t.type === 'offer') {
+        narrative = fromChip + ' <span class="narrative-text">offered ' + amountStr + ' for</span> ' + inscLink + (t.to_agent ? ' <span class="narrative-text">from</span> ' + toChip : '');
+      } else if (t.type === 'counter') {
+        narrative = fromChip + ' <span class="narrative-text">countered with ' + amountStr + ' on</span> ' + inscLink + (t.to_agent ? ' <span class="narrative-text">to</span> ' + toChip : '');
+      } else if (t.type === 'transfer') {
+        narrative = fromChip + ' <span class="narrative-text">transferred</span> ' + inscLink + (t.to_agent ? ' <span class="narrative-text">to</span> ' + toChip : '') + (amountStr ? ' <span class="narrative-text">for</span> ' + amountStr : '');
+      } else if (t.type === 'psbt_swap') {
+        narrative = fromChip + ' <span class="narrative-text">swapped</span> ' + inscLink + ' <span class="narrative-text">with</span> ' + toChip + (amountStr ? ' <span class="narrative-text">for</span> ' + amountStr : '');
+      } else if (t.type === 'cancel') {
+        narrative = fromChip + ' <span class="narrative-text">cancelled offer on</span> ' + inscLink;
+      }
+
       return '<div class="trade" data-id="' + t.id + '" data-type="' + esc(t.type) + '">' +
         '<div class="trade-header">' +
           '<span class="trade-type ' + esc(t.type) + '">' + esc(typeLabel) + sourceBadge + '</span>' +
@@ -1744,21 +1960,13 @@ async function loadTrades() {
           '<span class="trade-time">' + esc(timeAgo(t.created_at)) + '</span>' +
         '</div>' +
         '<div class="trade-body">' +
-          '<div class="trade-agents">' +
-            '<span class="agent-chip" role="button" tabindex="0" data-addr="' + safeFromAgent + '" aria-label="Filter by ' + fromName + '">' +
-              '<span class="agent-avatar" aria-hidden="true">' + fromAvatar + '</span>' +
-              '<span class="agent-name">' + fromName + '</span>' +
-            '</span>' +
-            (t.to_agent
-              ? ' <span class="arrow" aria-hidden="true">&#8594;</span> <span class="agent-chip" role="button" tabindex="0" data-addr="' + safeToAgent + '" aria-label="Filter by ' + toName + '">' +
-                  '<span class="agent-avatar" aria-hidden="true">' + toAvatar + '</span>' +
-                  '<span class="agent-name">' + toName + '</span>' +
-                '</span>'
-              : '') +
+          '<div class="trade-narrative">' + narrative + '</div>' +
+          '<div class="inscription-preview">' +
+            '<a href="https://ordinals.com/inscription/' + encodeURIComponent(t.inscription_id) + '" target="_blank" rel="noopener">' +
+              '<iframe src="https://ordinals.com/preview/' + encodeURIComponent(t.inscription_id) + '" sandbox="allow-scripts allow-same-origin" loading="lazy" title="Inscription preview"></iframe>' +
+            '</a>' +
           '</div>' +
           '<div class="trade-meta">' +
-            '<a class="inscription" href="https://ordinals.com/inscription/' + encodeURIComponent(t.inscription_id) + '" target="_blank" rel="noopener">' + inscriptionShort + '</a>' +
-            (t.amount_sats ? '<span class="amount">+' + formatSats(t.amount_sats) + '</span>' : '') +
             (t.tx_hash ? '<a class="tx-link" href="https://mempool.space/tx/' + encodeURIComponent(t.tx_hash) + '" target="_blank" rel="noopener">tx &#8599;</a>' : '') +
           '</div>' +
         '</div>' +
@@ -1909,6 +2117,11 @@ async function loadListings() {
               '<span class="agent-avatar">' + sellerAvatar + '</span>' +
               '<span class="agent-name">' + sellerName + '</span>' +
             '</span>' +
+          '</div>' +
+          '<div class="inscription-preview">' +
+            '<a href="https://ordinals.com/inscription/' + encodeURIComponent(l.inscription_id) + '" target="_blank" rel="noopener">' +
+              '<iframe src="https://ordinals.com/preview/' + encodeURIComponent(l.inscription_id) + '" sandbox="allow-scripts allow-same-origin" loading="lazy" title="Inscription preview"></iframe>' +
+            '</a>' +
           '</div>' +
           '<div class="trade-meta">' +
             '<a class="inscription" href="https://ordinals.com/inscription/' + encodeURIComponent(l.inscription_id) + '" target="_blank" rel="noopener">' + inscShort + '</a>' +

@@ -16,4 +16,6 @@ database_id = "aa569031-1697-48b5-a8ce-2c23ed3a90bb"
 crons = ["*/5 * * * *"]
 
 [vars]
+# SECURITY: Set CORS_ORIGIN to your frontend domain in production (e.g. "https://ledger.drx4.xyz")
+# Using "*" allows any origin — fine for a public read API but restrict for write endpoints if needed
 CORS_ORIGIN = "*"
