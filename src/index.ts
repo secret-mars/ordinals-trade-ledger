@@ -124,6 +124,58 @@ function pubkeyToBech32(pubkey: Uint8Array): string {
   return bech32Encode('bc', words);
 }
 
+// Base58Check encoding for Legacy P2PKH and P2SH-P2WPKH addresses
+const BASE58_ALPHABET = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz';
+
+function base58CheckEncode(version: number, payload: Uint8Array): string {
+  const data = new Uint8Array(1 + payload.length + 4);
+  data[0] = version;
+  data.set(payload, 1);
+  const checksum = sha256(sha256(data.subarray(0, 1 + payload.length)));
+  data.set(checksum.subarray(0, 4), 1 + payload.length);
+
+  // Convert to big integer for base58
+  let num = 0n;
+  for (const byte of data) num = num * 256n + BigInt(byte);
+
+  let encoded = '';
+  while (num > 0n) {
+    encoded = BASE58_ALPHABET[Number(num % 58n)] + encoded;
+    num = num / 58n;
+  }
+
+  // Preserve leading zeros
+  for (const byte of data) {
+    if (byte !== 0) break;
+    encoded = '1' + encoded;
+  }
+
+  return encoded;
+}
+
+function pubkeyToP2PKH(pubkey: Uint8Array): string {
+  const hash = ripemd160(sha256(pubkey));
+  return base58CheckEncode(0x00, hash); // version 0x00 = mainnet P2PKH
+}
+
+function pubkeyToP2SH_P2WPKH(pubkey: Uint8Array): string {
+  const keyHash = ripemd160(sha256(pubkey));
+  // P2SH-P2WPKH redeemScript: OP_0 <20-byte-key-hash>
+  const redeemScript = new Uint8Array(22);
+  redeemScript[0] = 0x00; // OP_0
+  redeemScript[1] = 0x14; // push 20 bytes
+  redeemScript.set(keyHash, 2);
+  const scriptHash = ripemd160(sha256(redeemScript));
+  return base58CheckEncode(0x05, scriptHash); // version 0x05 = mainnet P2SH
+}
+
+// Derive address from pubkey based on BIP-137 header byte range
+function deriveAddress(pubkey: Uint8Array, header: number): string {
+  if (header >= 39) return pubkeyToBech32(pubkey);          // 39-42: P2WPKH (bc1q...)
+  if (header >= 35) return pubkeyToP2SH_P2WPKH(pubkey);    // 35-38: P2SH-P2WPKH (3...)
+  return pubkeyToP2PKH(pubkey);                              // 27-34: P2PKH (1...)
+}
+
 async function verifyBip137(signature: string, message: string, expectedAddress: string): Promise<string | null> {
   let sigBytes: Uint8Array;
   try {
@@ -153,7 +205,7 @@ async function verifyBip137(signature: string, message: string, expectedAddress:
     pubkey = point.toRawBytes(compressed);
   } catch { return 'Signature recovery failed: invalid signature for this message'; }
 
-  const derivedAddress = pubkeyToBech32(pubkey);
+  const derivedAddress = deriveAddress(pubkey, header);
   if (derivedAddress !== expectedAddress) {
     return `Signature mismatch: recovered ${derivedAddress}, expected ${expectedAddress}`;
   }
