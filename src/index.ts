@@ -39,11 +39,42 @@ function json(data: unknown, status = 200, origin = '*'): Response {
   });
 }
 
+// --- Input Validation ---
+
+function isValidBtcAddress(addr: string): boolean {
+  return /^(bc1|[13])[a-zA-HJ-NP-Z0-9]{25,62}$/.test(addr);
+}
+
+function isValidStxAddress(addr: string): boolean {
+  return /^(SP|SM)[A-Z0-9]{38,}$/.test(addr);
+}
+
+function isValidInscriptionId(id: string): boolean {
+  return /^[a-f0-9]{64}i\d+$/.test(id);
+}
+
+function isValidTxHash(hash: string): boolean {
+  return /^[a-f0-9]{64}$/.test(hash);
+}
+
+const MAX_DISPLAY_NAME = 50;
+const MAX_DESCRIPTION = 500;
+const MAX_METADATA = 1000;
+
 // Auth: require BIP-137 signature on all write endpoints
 // Signature message format: "ordinals-ledger | {type} | {from_agent} | {inscription_id} | {timestamp}"
 // Timestamp must be within 300 seconds of server time
 function validateAuth(body: any): string | null {
   if (!body.from_agent) return 'Required: from_agent';
+  if (!isValidBtcAddress(body.from_agent)) return 'Invalid from_agent: must be a valid Bitcoin address';
+  if (body.to_agent && !isValidBtcAddress(body.to_agent)) return 'Invalid to_agent: must be a valid Bitcoin address';
+  if (body.inscription_id && !isValidInscriptionId(body.inscription_id)) return 'Invalid inscription_id: must be {64-hex-txid}i{number}';
+  if (body.tx_hash && !isValidTxHash(body.tx_hash)) return 'Invalid tx_hash: must be 64 hex characters';
+  if (body.from_stx_address && !isValidStxAddress(body.from_stx_address)) return 'Invalid from_stx_address';
+  if (body.to_stx_address && !isValidStxAddress(body.to_stx_address)) return 'Invalid to_stx_address';
+  if (body.from_display_name && body.from_display_name.length > MAX_DISPLAY_NAME) return `from_display_name exceeds ${MAX_DISPLAY_NAME} chars`;
+  if (body.to_display_name && body.to_display_name.length > MAX_DISPLAY_NAME) return `to_display_name exceeds ${MAX_DISPLAY_NAME} chars`;
+  if (body.metadata && body.metadata.length > MAX_METADATA) return `metadata exceeds ${MAX_METADATA} chars`;
   if (!body.signature) return 'Required: signature (BIP-137 signed message)';
   if (!body.timestamp) return 'Required: timestamp (ISO 8601)';
 
@@ -675,6 +706,22 @@ export default {
           return json({ error: 'Required: inscription_id, seller_btc_address, price_floor_sats' }, 400, origin);
         }
 
+        if (!isValidBtcAddress(body.seller_btc_address)) {
+          return json({ error: 'Invalid seller_btc_address: must be a valid Bitcoin address' }, 400, origin);
+        }
+        if (!isValidInscriptionId(body.inscription_id)) {
+          return json({ error: 'Invalid inscription_id: must be {64-hex-txid}i{number}' }, 400, origin);
+        }
+        if (body.seller_stx_address && !isValidStxAddress(body.seller_stx_address)) {
+          return json({ error: 'Invalid seller_stx_address' }, 400, origin);
+        }
+        if (body.seller_display_name && body.seller_display_name.length > MAX_DISPLAY_NAME) {
+          return json({ error: `seller_display_name exceeds ${MAX_DISPLAY_NAME} chars` }, 400, origin);
+        }
+        if (body.description && body.description.length > MAX_DESCRIPTION) {
+          return json({ error: `description exceeds ${MAX_DESCRIPTION} chars` }, 400, origin);
+        }
+
         if (typeof body.price_floor_sats !== 'number' || body.price_floor_sats <= 0) {
           return json({ error: 'price_floor_sats must be a positive number' }, 400, origin);
         }
@@ -782,6 +829,9 @@ export default {
         // Auth required
         if (!body.signature || !body.timestamp || !body.seller_btc_address) {
           return json({ error: 'Required: seller_btc_address, signature, timestamp' }, 401, origin);
+        }
+        if (!isValidBtcAddress(body.seller_btc_address)) {
+          return json({ error: 'Invalid seller_btc_address' }, 400, origin);
         }
 
         const ts = new Date(body.timestamp).getTime();
