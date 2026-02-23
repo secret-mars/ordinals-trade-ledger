@@ -65,6 +65,16 @@ const MAX_DISPLAY_NAME = 50;
 const MAX_DESCRIPTION = 500;
 const MAX_METADATA = 1000;
 
+// --- D1 Helper ---
+
+async function dbRun(stmt: D1PreparedStatement): Promise<D1Result> {
+  const result = await stmt.run();
+  if (!result.success) {
+    throw new Error('Database operation failed');
+  }
+  return result;
+}
+
 // --- BIP-137 Signature Verification ---
 
 function encodeVarint(n: number): Uint8Array {
@@ -262,7 +272,7 @@ async function validateAuth(body: any): Promise<string | null> {
 }
 
 async function ensureAgent(db: D1Database, btcAddress: string, displayName?: string, stxAddress?: string, taprootAddress?: string) {
-  await db
+  await dbRun(db
     .prepare(
       `INSERT INTO agents (btc_address, display_name, stx_address, taproot_address) VALUES (?, ?, ?, ?)
        ON CONFLICT(btc_address) DO UPDATE SET
@@ -271,7 +281,7 @@ async function ensureAgent(db: D1Database, btcAddress: string, displayName?: str
          taproot_address = COALESCE(excluded.taproot_address, agents.taproot_address)`
     )
     .bind(btcAddress, displayName || null, stxAddress || null, taprootAddress || null)
-    .run();
+  );
 }
 
 // --- On-Chain Watcher ---
@@ -386,14 +396,14 @@ async function syncAgentsFromAibtc(db: D1Database): Promise<number> {
 
     for (const a of data.agents) {
       if (!a.btcAddress) continue;
-      await db
+      await dbRun(db
         .prepare(
           `INSERT INTO agents (btc_address, display_name, stx_address) VALUES (?, ?, ?)
            ON CONFLICT(btc_address) DO UPDATE SET
              display_name = COALESCE(agents.display_name, excluded.display_name),
              stx_address = COALESCE(excluded.stx_address, agents.stx_address)`)
         .bind(a.btcAddress, a.displayName || a.bnsName || null, a.stxAddress || null)
-        .run();
+      );
       synced++;
     }
 
@@ -415,9 +425,9 @@ async function runWatcher(env: Env): Promise<void> {
   if (inProgress) return;
 
   // Start run
-  const run = await db
+  const run = await dbRun(db
     .prepare("INSERT INTO watcher_runs (status) VALUES ('running')")
-    .run();
+  );
   const runId = run.meta.last_row_id;
 
   let agentsChecked = 0;
@@ -498,37 +508,37 @@ async function runWatcher(env: Env): Promise<void> {
 
               if (previousHolder) {
                 // Log as detected transfer
-                await db
+                await dbRun(db
                   .prepare(
                     `INSERT INTO trades (type, from_agent, to_agent, inscription_id, status, source, metadata)
                      VALUES ('transfer', ?, ?, ?, 'completed', 'watcher', 'Auto-detected by on-chain watcher')`
                   )
                   .bind(previousHolder, agent.btc_address, insc.id)
-                  .run();
+                );
 
                 // Update trade counts
-                await db.prepare('UPDATE agents SET trade_count = trade_count + 1 WHERE btc_address = ?').bind(previousHolder).run();
-                await db.prepare('UPDATE agents SET trade_count = trade_count + 1 WHERE btc_address = ?').bind(agent.btc_address).run();
+                await dbRun(db.prepare('UPDATE agents SET trade_count = trade_count + 1 WHERE btc_address = ?').bind(previousHolder));
+                await dbRun(db.prepare('UPDATE agents SET trade_count = trade_count + 1 WHERE btc_address = ?').bind(agent.btc_address));
 
                 transfersFound++;
               }
             }
 
             // Add to snapshot under primary btc_address (unified per agent)
-            await db
+            await dbRun(db
               .prepare('INSERT OR IGNORE INTO agent_inscriptions (btc_address, inscription_id) VALUES (?, ?)')
               .bind(agent.btc_address, insc.id)
-              .run();
+            );
           }
         }
 
         // Missing inscriptions = outgoing transfers — remove from snapshot
         for (const prev of snapshot.results) {
           if (!currentIds.has(prev.inscription_id)) {
-            await db
+            await dbRun(db
               .prepare('DELETE FROM agent_inscriptions WHERE btc_address = ? AND inscription_id = ?')
               .bind(agent.btc_address, prev.inscription_id)
-              .run();
+            );
           }
         }
       } catch (agentErr: any) {
@@ -542,23 +552,23 @@ async function runWatcher(env: Env): Promise<void> {
     }
 
     // Complete run
-    await db
+    await dbRun(db
       .prepare(
         "UPDATE watcher_runs SET status = 'completed', finished_at = datetime('now'), agents_checked = ?, transfers_found = ?, errors = ? WHERE id = ?"
       )
       .bind(agentsChecked, transfersFound, errors.length ? errors.join('; ') : null, runId)
-      .run();
+    );
   } catch (e: any) {
-    await db
+    await dbRun(db
       .prepare(
         "UPDATE watcher_runs SET status = 'error', finished_at = datetime('now'), agents_checked = ?, transfers_found = ?, errors = ? WHERE id = ?"
       )
       .bind(agentsChecked, transfersFound, e.message, runId)
-      .run();
+    );
   }
 
   // Cleanup: keep only the 100 most recent watcher_runs to prevent unbounded table growth
-  await db.prepare("DELETE FROM watcher_runs WHERE id NOT IN (SELECT id FROM watcher_runs ORDER BY id DESC LIMIT 100)").run();
+  await dbRun(db.prepare("DELETE FROM watcher_runs WHERE id NOT IN (SELECT id FROM watcher_runs ORDER BY id DESC LIMIT 100)"));
 }
 
 export default {
@@ -613,7 +623,7 @@ export default {
         if (body.type === 'psbt_swap') status = 'completed';
         if (body.type === 'cancel') status = 'cancelled';
 
-        const result = await env.DB
+        const result = await dbRun(env.DB
           .prepare(
             `INSERT INTO trades (type, from_agent, to_agent, inscription_id, amount_sats, status, tx_hash, parent_trade_id, metadata, source)
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'manual')`
@@ -629,9 +639,7 @@ export default {
             body.parent_trade_id ?? null,
             body.metadata ?? null
           )
-          .run();
-
-        if (!result.success) return json({ error: 'Database write failed' }, 500, origin);
+        );
 
         // Update parent trade status if this is a counter or transfer
         if (body.parent_trade_id) {
@@ -639,30 +647,30 @@ export default {
             return json({ error: `Trade type '${body.type}' cannot reference a parent_trade_id` }, 400, origin);
           }
           const parentStatus = body.type === 'counter' ? 'countered' : 'completed';
-          await env.DB
+          await dbRun(env.DB
             .prepare('UPDATE trades SET status = ?, updated_at = datetime(\'now\') WHERE id = ?')
             .bind(parentStatus, body.parent_trade_id)
-            .run();
+          );
         }
 
         // Auto-close marketplace listings when a psbt_swap or transfer completes for the same inscription
         if ((body.type === 'psbt_swap' || body.type === 'transfer') && body.inscription_id) {
-          await env.DB
+          await dbRun(env.DB
             .prepare("UPDATE listings SET status = 'sold', trade_id = ?, updated_at = datetime('now') WHERE inscription_id = ? AND status = 'active'")
             .bind(result.meta.last_row_id, body.inscription_id)
-            .run();
+          );
         }
 
         // Increment trade counts
-        await env.DB
+        await dbRun(env.DB
           .prepare('UPDATE agents SET trade_count = trade_count + 1 WHERE btc_address = ?')
           .bind(body.from_agent)
-          .run();
+        );
         if (body.to_agent) {
-          await env.DB
+          await dbRun(env.DB
             .prepare('UPDATE agents SET trade_count = trade_count + 1 WHERE btc_address = ?')
             .bind(body.to_agent)
-            .run();
+          );
         }
 
         return json({ success: true, trade_id: result.meta.last_row_id }, 201, origin);
@@ -793,10 +801,10 @@ export default {
         }
 
         // Update taproot address
-        await env.DB
+        await dbRun(env.DB
           .prepare('UPDATE agents SET taproot_address = ? WHERE btc_address = ?')
           .bind(body.taproot_address, body.btc_address)
-          .run();
+        );
 
         return json({ success: true, btc_address: body.btc_address, taproot_address: body.taproot_address }, 200, origin);
       } catch (e: any) {
@@ -933,23 +941,21 @@ export default {
         // Upsert seller agent
         await ensureAgent(env.DB, body.seller_btc_address, body.seller_display_name, body.seller_stx_address);
 
-        let result: any;
+        let result: D1Result;
         try {
-          result = await env.DB
+          result = await dbRun(env.DB
             .prepare(
               `INSERT INTO listings (inscription_id, seller_btc_address, price_floor_sats, description)
                VALUES (?, ?, ?, ?)`
             )
             .bind(body.inscription_id, body.seller_btc_address, body.price_floor_sats, body.description || null)
-            .run();
+          );
         } catch (insertErr: any) {
           if (insertErr?.message?.includes('UNIQUE constraint')) {
             return json({ error: 'Active listing already exists for this inscription' }, 409, origin);
           }
           throw insertErr;
         }
-
-        if (!result.success) return json({ error: 'Database write failed' }, 500, origin);
 
         return json({ success: true, listing_id: result.meta.last_row_id }, 201, origin);
       } catch (e: any) {
@@ -1050,10 +1056,10 @@ export default {
           return json({ error: 'Only the seller can update this listing' }, 403, origin);
         }
 
-        await env.DB
+        await dbRun(env.DB
           .prepare("UPDATE listings SET status = ?, trade_id = ?, updated_at = datetime('now') WHERE id = ?")
           .bind(body.status, body.trade_id || null, id)
-          .run();
+        );
 
         return json({ success: true }, 200, origin);
       } catch (e: any) {
