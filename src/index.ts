@@ -930,13 +930,21 @@ export default {
         // Upsert seller agent
         await ensureAgent(env.DB, body.seller_btc_address, body.seller_display_name, body.seller_stx_address);
 
-        const result = await env.DB
-          .prepare(
-            `INSERT INTO listings (inscription_id, seller_btc_address, price_floor_sats, description)
-             VALUES (?, ?, ?, ?)`
-          )
-          .bind(body.inscription_id, body.seller_btc_address, body.price_floor_sats, body.description || null)
-          .run();
+        let result: any;
+        try {
+          result = await env.DB
+            .prepare(
+              `INSERT INTO listings (inscription_id, seller_btc_address, price_floor_sats, description)
+               VALUES (?, ?, ?, ?)`
+            )
+            .bind(body.inscription_id, body.seller_btc_address, body.price_floor_sats, body.description || null)
+            .run();
+        } catch (insertErr: any) {
+          if (insertErr?.message?.includes('UNIQUE constraint')) {
+            return json({ error: 'Active listing already exists for this inscription' }, 409, origin);
+          }
+          throw insertErr;
+        }
 
         if (!result.success) return json({ error: 'Database write failed' }, 500, origin);
 
