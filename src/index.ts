@@ -633,9 +633,12 @@ export default {
 
         if (!result.success) return json({ error: 'Database write failed' }, 500, origin);
 
-        // Update parent trade status if this is a counter/transfer/cancel
+        // Update parent trade status if this is a counter or transfer
         if (body.parent_trade_id) {
-          const parentStatus = body.type === 'counter' ? 'countered' : body.type === 'transfer' ? 'completed' : 'cancelled';
+          if (body.type === 'offer' || body.type === 'psbt_swap') {
+            return json({ error: `Trade type '${body.type}' cannot reference a parent_trade_id` }, 400, origin);
+          }
+          const parentStatus = body.type === 'counter' ? 'countered' : 'completed';
           await env.DB
             .prepare('UPDATE trades SET status = ?, updated_at = datetime(\'now\') WHERE id = ?')
             .bind(parentStatus, body.parent_trade_id)
