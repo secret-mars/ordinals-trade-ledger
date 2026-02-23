@@ -755,8 +755,8 @@ export default {
           return json({ error: 'Required: btc_address, taproot_address' }, 400, origin);
         }
 
-        if (!body.taproot_address.startsWith('bc1p')) {
-          return json({ error: 'taproot_address must be a taproot address (bc1p...)' }, 400, origin);
+        if (!isValidBtcAddress(body.taproot_address) || !body.taproot_address.startsWith('bc1p')) {
+          return json({ error: 'taproot_address must be a valid taproot address (bc1p...)' }, 400, origin);
         }
 
         // Auth: require BIP-137 signature
