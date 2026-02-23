@@ -616,6 +616,17 @@ export default {
           await ensureAgent(env.DB, body.to_agent, body.to_display_name, body.to_stx_address);
         }
 
+        // Validate parent_trade_id before inserting
+        if (body.parent_trade_id) {
+          if (body.type === 'offer' || body.type === 'psbt_swap') {
+            return json({ error: `Trade type '${body.type}' cannot reference a parent_trade_id` }, 400, origin);
+          }
+          const parent = await env.DB.prepare('SELECT id FROM trades WHERE id = ?').bind(body.parent_trade_id).first();
+          if (!parent) {
+            return json({ error: 'parent_trade_id does not exist' }, 400, origin);
+          }
+        }
+
         // Determine status based on type
         let status = 'open';
         if (body.type === 'counter') status = 'countered';
@@ -643,9 +654,6 @@ export default {
 
         // Update parent trade status if this is a counter or transfer
         if (body.parent_trade_id) {
-          if (body.type === 'offer' || body.type === 'psbt_swap') {
-            return json({ error: `Trade type '${body.type}' cannot reference a parent_trade_id` }, 400, origin);
-          }
           const parentStatus = body.type === 'counter' ? 'countered' : 'completed';
           await dbRun(env.DB
             .prepare('UPDATE trades SET status = ?, updated_at = datetime(\'now\') WHERE id = ?')
@@ -1054,6 +1062,13 @@ export default {
 
         if (listing.seller_btc_address !== body.seller_btc_address) {
           return json({ error: 'Only the seller can update this listing' }, 403, origin);
+        }
+
+        if (body.trade_id) {
+          const trade = await env.DB.prepare('SELECT id FROM trades WHERE id = ?').bind(body.trade_id).first();
+          if (!trade) {
+            return json({ error: 'trade_id does not exist' }, 400, origin);
+          }
         }
 
         await dbRun(env.DB
