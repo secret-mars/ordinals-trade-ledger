@@ -345,6 +345,10 @@ async function fetchAgentInscriptions(address: string, unisatApiKey?: string): P
     if (!data.data?.inscription) break;
 
     for (const insc of data.data.inscription) {
+      if (!insc.inscriptionId || !isValidInscriptionId(insc.inscriptionId)) {
+        console.error(`Unisat: skipping entry with invalid inscriptionId: ${JSON.stringify(insc.inscriptionId)}`);
+        continue;
+      }
       all.push({
         id: insc.inscriptionId,
         number: insc.inscriptionNumber,
@@ -407,7 +411,10 @@ async function syncAgentsFromAibtc(db: D1Database): Promise<number> {
     if (!data.agents || data.agents.length === 0) break;
 
     for (const a of data.agents) {
-      if (!a.btcAddress) continue;
+      if (!a.btcAddress) {
+        console.error(`AIBTC agent sync: skipping agent without btcAddress: ${JSON.stringify(a)}`);
+        continue;
+      }
       await dbRun(db
         .prepare(
           `INSERT INTO agents (btc_address, display_name, stx_address) VALUES (?, ?, ?)
@@ -419,7 +426,7 @@ async function syncAgentsFromAibtc(db: D1Database): Promise<number> {
       synced++;
     }
 
-    if (!data.pagination.hasMore) break;
+    if (!data.pagination?.hasMore) break;
     offset += limit;
   }
 
