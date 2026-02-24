@@ -514,28 +514,27 @@ async function runWatcher(env: Env): Promise<void> {
         // New inscriptions = incoming transfers
         for (const insc of allInscriptions) {
           if (!previousIds.has(insc.id)) {
-            // Check dedup: no matching trade in last 24h for this inscription+agent
-            const existing = await db
-              .prepare(
-                "SELECT id FROM trades WHERE inscription_id = ? AND to_agent = ? AND created_at > datetime('now', '-1 day')"
-              )
-              .bind(insc.id, agent.btc_address)
-              .first();
+            const previousHolder = await findPreviousHolder(db, insc.id, agent.btc_address);
 
-            if (!existing) {
-              const previousHolder = await findPreviousHolder(db, insc.id, agent.btc_address);
+            if (previousHolder) {
+              // Fix for TOCTOU race condition (issue #23): use a single atomic
+              // INSERT ... SELECT WHERE NOT EXISTS statement so the duplicate
+              // check and the insert happen together without a gap that a
+              // concurrent manual POST /api/trades could exploit.
+              const insertResult = await db
+                .prepare(
+                  `INSERT INTO trades (type, from_agent, to_agent, inscription_id, status, source, metadata)
+                   SELECT 'transfer', ?, ?, ?, 'completed', 'watcher', 'Auto-detected by on-chain watcher'
+                   WHERE NOT EXISTS (
+                     SELECT 1 FROM trades
+                     WHERE inscription_id = ? AND to_agent = ? AND created_at > datetime('now', '-1 day')
+                   )`
+                )
+                .bind(previousHolder, agent.btc_address, insc.id, insc.id, agent.btc_address)
+                .run();
 
-              if (previousHolder) {
-                // Log as detected transfer
-                await dbRun(db
-                  .prepare(
-                    `INSERT INTO trades (type, from_agent, to_agent, inscription_id, status, source, metadata)
-                     VALUES ('transfer', ?, ?, ?, 'completed', 'watcher', 'Auto-detected by on-chain watcher')`
-                  )
-                  .bind(previousHolder, agent.btc_address, insc.id)
-                );
-
-                // Update trade counts
+              if (insertResult.meta.rows_written > 0) {
+                // Update trade counts only when the insert actually happened
                 await dbRun(db.prepare('UPDATE agents SET trade_count = trade_count + 1 WHERE btc_address = ?').bind(previousHolder));
                 await dbRun(db.prepare('UPDATE agents SET trade_count = trade_count + 1 WHERE btc_address = ?').bind(agent.btc_address));
 
