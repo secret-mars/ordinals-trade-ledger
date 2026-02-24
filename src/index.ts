@@ -65,6 +65,18 @@ const MAX_DISPLAY_NAME = 50;
 const MAX_DESCRIPTION = 500;
 const MAX_METADATA = 1000;
 
+const MAX_BODY_SIZE = 1024 * 1024; // 1MB
+function checkBodySize(request: Request): Response | null {
+  const contentLength = parseInt(request.headers.get('content-length') || '0');
+  if (contentLength > MAX_BODY_SIZE) {
+    return new Response(JSON.stringify({ error: 'Request body too large' }), {
+      status: 413,
+      headers: { 'Content-Type': 'application/json' }
+    });
+  }
+  return null;
+}
+
 // --- D1 Helper ---
 
 async function dbRun(stmt: D1PreparedStatement): Promise<D1Result> {
@@ -587,6 +599,8 @@ export default {
     // POST /api/trades — Log a new trade event
     if (request.method === 'POST' && path === '/api/trades') {
       try {
+        const sizeError = checkBodySize(request);
+        if (sizeError) return sizeError;
         const body = (await request.json()) as TradeInput & { signature?: string; timestamp?: string };
 
         if (!body.type || !body.from_agent || !body.inscription_id) {
@@ -763,6 +777,8 @@ export default {
     // POST /api/agents/taproot — Register a taproot address for an agent
     if (request.method === 'POST' && path === '/api/agents/taproot') {
       try {
+        const sizeError = checkBodySize(request);
+        if (sizeError) return sizeError;
         const body = await request.json() as {
           btc_address?: string;
           taproot_address?: string;
@@ -888,6 +904,8 @@ export default {
     // POST /api/listings — Create a new listing (list an ordinal for sale)
     if (request.method === 'POST' && path === '/api/listings') {
       try {
+        const sizeError = checkBodySize(request);
+        if (sizeError) return sizeError;
         const body = await request.json() as any;
 
         if (!body.inscription_id || !body.seller_btc_address || !body.price_floor_sats) {
@@ -1022,6 +1040,8 @@ export default {
     if (request.method === 'PATCH' && path.match(/^\/api\/listings\/\d+$/)) {
       try {
         const id = parseInt(path.split('/').pop()!);
+        const sizeError = checkBodySize(request);
+        if (sizeError) return sizeError;
         const body = await request.json() as any;
 
         if (!body.status || !['delisted', 'sold'].includes(body.status)) {
