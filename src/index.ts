@@ -641,9 +641,17 @@ export default {
           if (body.type === 'offer' || body.type === 'psbt_swap') {
             return json({ error: `Trade type '${body.type}' cannot reference a parent_trade_id` }, 400, origin);
           }
-          const parent = await env.DB.prepare('SELECT id FROM trades WHERE id = ?').bind(body.parent_trade_id).first();
+          const parent = await env.DB.prepare('SELECT id, from_agent, to_agent FROM trades WHERE id = ?').bind(body.parent_trade_id).first() as { id: number; from_agent: string; to_agent: string | null } | null;
           if (!parent) {
             return json({ error: 'parent_trade_id does not exist' }, 400, origin);
+          }
+          // Ownership check: only the seller (from_agent) or buyer (to_agent) of the parent trade
+          // may cancel or counter it. Any other agent is rejected with 403.
+          if (body.type === 'cancel' || body.type === 'counter') {
+            const caller = body.from_agent;
+            if (caller !== parent.from_agent && caller !== parent.to_agent) {
+              return json({ error: 'Forbidden: only a party to the original trade may cancel or counter it' }, 403, origin);
+            }
           }
         }
 
