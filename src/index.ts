@@ -46,7 +46,14 @@ function json(data: unknown, status = 200, origin = '*'): Response {
 // --- Input Validation ---
 
 function isValidBtcAddress(addr: string): boolean {
-  return /^(bc1|[13])[a-zA-HJ-NP-Z0-9]{25,62}$/.test(addr);
+  // BIP-173/BIP-350: bech32/bech32m addresses must be all lowercase (or all uppercase,
+  // but Bitcoin software rejects uppercase — enforce lowercase only)
+  if (addr.startsWith('bc1') || addr.startsWith('BC1')) {
+    if (addr !== addr.toLowerCase()) return false;
+    return /^bc1[a-z0-9]{6,87}$/.test(addr);
+  }
+  // Legacy P2PKH (1...) and P2SH (3...) addresses use Base58Check (case-sensitive, mixed case ok)
+  return /^[13][a-zA-HJ-NP-Z0-9]{25,34}$/.test(addr);
 }
 
 function isValidStxAddress(addr: string): boolean {
