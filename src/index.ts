@@ -908,7 +908,7 @@ export default {
           if (body.type === 'offer' || body.type === 'psbt_swap') {
             return json({ error: `Trade type '${body.type}' cannot reference a parent_trade_id` }, 400, corsOrigin);
           }
-          const parent = await env.DB.prepare('SELECT id, from_agent, to_agent FROM trades WHERE id = ?').bind(body.parent_trade_id).first() as { id: number; from_agent: string; to_agent: string | null } | null;
+          const parent = await env.DB.prepare('SELECT id, from_agent, to_agent FROM trades WHERE id = ?').bind(body.parent_trade_id).first<{ id: number; from_agent: string; to_agent: string | null }>();
           if (!parent) {
             return json({ error: 'parent_trade_id does not exist' }, 400, corsOrigin);
           }
