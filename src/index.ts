@@ -422,8 +422,9 @@ async function findPreviousHolder(db: D1Database, inscriptionId: string, current
   return null;
 }
 
-async function syncAgentsFromAibtc(db: D1Database): Promise<number> {
+async function syncAgentsFromAibtc(db: D1Database): Promise<{ synced: number; skipped: number }> {
   let synced = 0;
+  let skipped = 0;
   let offset = 0;
   const limit = 100;
 
@@ -439,10 +440,20 @@ async function syncAgentsFromAibtc(db: D1Database): Promise<number> {
     if (!data.agents || data.agents.length === 0) break;
 
     for (const a of data.agents) {
-      if (!a.btcAddress) {
-        console.error(`AIBTC agent sync: skipping agent without btcAddress: ${JSON.stringify(a)}`);
+      // Validate BTC address before inserting — reject missing or malformed addresses
+      if (!a.btcAddress || !isValidBtcAddress(a.btcAddress)) {
+        console.error(`AIBTC agent sync: skipping agent with invalid btcAddress: ${JSON.stringify(a)}`);
+        skipped++;
         continue;
       }
+
+      // Validate STX address when present — reject malformed values rather than storing them
+      if (a.stxAddress && !isValidStxAddress(a.stxAddress)) {
+        console.error(`AIBTC agent sync: skipping agent with invalid stxAddress: ${JSON.stringify(a)}`);
+        skipped++;
+        continue;
+      }
+
       await dbRun(db
         .prepare(
           `INSERT INTO agents (btc_address, display_name, stx_address) VALUES (?, ?, ?)
@@ -458,7 +469,7 @@ async function syncAgentsFromAibtc(db: D1Database): Promise<number> {
     offset += limit;
   }
 
-  return synced;
+  return { synced, skipped };
 }
 
 async function runWatcher(env: Env): Promise<void> {
@@ -486,7 +497,10 @@ async function runWatcher(env: Env): Promise<void> {
     const runCount = await db.prepare('SELECT COUNT(*) as c FROM watcher_runs').first<{ c: number }>();
     if ((runCount?.c || 0) % 6 === 1) {
       try {
-        await syncAgentsFromAibtc(db);
+        const syncResult = await syncAgentsFromAibtc(db);
+        if (syncResult.skipped > 0) {
+          console.warn(`AIBTC agent sync: inserted ${syncResult.synced}, skipped ${syncResult.skipped} agents with invalid addresses`);
+        }
       } catch (syncErr: any) {
         errors.push(`aibtc sync: ${syncErr.message}`);
       }
