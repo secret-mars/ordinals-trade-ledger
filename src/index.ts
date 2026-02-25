@@ -493,9 +493,11 @@ async function runWatcher(env: Env): Promise<void> {
   const errors: string[] = [];
 
   try {
-    // Sync agents from AIBTC every 6th run (~30 min) to save subrequests
-    const runCount = await db.prepare('SELECT COUNT(*) as c FROM watcher_runs').first<{ c: number }>();
-    if ((runCount?.c || 0) % 6 === 1) {
+    // Sync agents from AIBTC every 6th run (~30 min) to save subrequests.
+    // Use the auto-incrementing run ID rather than COUNT(*) so that this condition
+    // keeps firing correctly after the watcher_runs table is pruned to a fixed size
+    // (COUNT(*) stabilises at the cap value, which may never satisfy % 6 === 1).
+    if (((runId as number) % 6) === 1) {
       try {
         const syncResult = await syncAgentsFromAibtc(db);
         if (syncResult.skipped > 0) {
@@ -627,8 +629,8 @@ async function runWatcher(env: Env): Promise<void> {
     );
   }
 
-  // Cleanup: keep only the 100 most recent watcher_runs to prevent unbounded table growth
-  await dbRun(db.prepare("DELETE FROM watcher_runs WHERE id NOT IN (SELECT id FROM watcher_runs ORDER BY id DESC LIMIT 100)"));
+  // Cleanup: keep only the 50 most recent watcher_runs to prevent unbounded table growth
+  await dbRun(db.prepare("DELETE FROM watcher_runs WHERE id NOT IN (SELECT id FROM watcher_runs ORDER BY id DESC LIMIT 50)"));
 }
 
 export default {
