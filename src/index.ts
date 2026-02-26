@@ -8,7 +8,6 @@ import { ripemd160 } from '@noble/hashes/ripemd160';
 
 interface Env {
   DB: D1Database;
-  CORS_ORIGIN: string;
   HIRO_API_KEY?: string;
   UNISAT_API_KEY?: string;
 }
@@ -28,18 +27,59 @@ interface TradeInput {
   to_stx_address?: string;
 }
 
-function corsHeaders(origin: string): HeadersInit {
-  return {
+// Origins allowed to make write requests (POST, PATCH, PUT, DELETE).
+// GET/HEAD remain open to all origins — this is a public read ledger.
+const WRITE_ALLOWED_ORIGINS: readonly string[] = [
+  'https://ledger.drx4.xyz',
+];
+
+const WRITE_METHODS = new Set(['POST', 'PUT', 'PATCH', 'DELETE']);
+
+/**
+ * Returns the value to use for Access-Control-Allow-Origin.
+ *
+ * - Read requests (GET, HEAD, OPTIONS for read): wildcard '*' — public ledger data.
+ * - Write requests (POST, PUT, PATCH, DELETE) and their preflight: restrict to
+ *   WRITE_ALLOWED_ORIGINS plus localhost (any port) for local development.
+ *   If the request origin is not on the allowlist, returns null (block CORS).
+ */
+function resolveCorsOrigin(requestOrigin: string | null, isWrite: boolean): string | null {
+  if (!isWrite) return '*';
+  if (!requestOrigin) return null;
+
+  // Allow exact production origins
+  if ((WRITE_ALLOWED_ORIGINS as string[]).includes(requestOrigin)) return requestOrigin;
+
+  // Allow localhost on any port for development
+  if (/^https?:\/\/localhost(:\d+)?$/.test(requestOrigin)) return requestOrigin;
+  if (/^https?:\/\/127\.0\.0\.1(:\d+)?$/.test(requestOrigin)) return requestOrigin;
+
+  return null;
+}
+
+function corsHeaders(origin: string, vary = false): HeadersInit {
+  const headers: Record<string, string> = {
     'Access-Control-Allow-Origin': origin,
     'Access-Control-Allow-Methods': 'GET, POST, PATCH, DELETE, OPTIONS',
     'Access-Control-Allow-Headers': 'Content-Type',
   };
+  if (vary) headers['Vary'] = 'Origin';
+  return headers;
 }
 
-function json(data: unknown, status = 200, origin = '*'): Response {
+function json(data: unknown, status = 200, corsOrigin: string | null = '*'): Response {
+  // If CORS origin is null the request came from a disallowed origin for a write route.
+  // Return 403 with no CORS headers so the browser blocks the response.
+  if (corsOrigin === null) {
+    return new Response(JSON.stringify({ error: 'Origin not allowed' }), {
+      status: 403,
+      headers: { 'Content-Type': 'application/json' },
+    });
+  }
+  const vary = corsOrigin !== '*';
   return new Response(JSON.stringify(data), {
     status,
-    headers: { 'Content-Type': 'application/json', ...corsHeaders(origin) },
+    headers: { 'Content-Type': 'application/json', ...corsHeaders(corsOrigin, vary) },
   });
 }
 
@@ -635,13 +675,23 @@ async function runWatcher(env: Env): Promise<void> {
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
-    const origin = env.CORS_ORIGIN || '*';
+    const requestOrigin = request.headers.get('Origin');
+    // Resolve CORS origin once for the whole request: write methods are restricted
+    // to the allowlist, reads use wildcard so public ledger data stays accessible.
+    const corsOrigin = resolveCorsOrigin(requestOrigin, WRITE_METHODS.has(request.method));
     try {
     const url = new URL(request.url);
     const path = url.pathname;
 
     if (request.method === 'OPTIONS') {
-      return new Response(null, { status: 204, headers: corsHeaders(origin) });
+      // Check what method the preflight is for
+      const requestedMethod = request.headers.get('Access-Control-Request-Method') ?? '';
+      const isWrite = WRITE_METHODS.has(requestedMethod.toUpperCase());
+      const preflightOrigin = resolveCorsOrigin(requestOrigin, isWrite);
+      if (preflightOrigin === null) {
+        return new Response(null, { status: 204 });
+      }
+      return new Response(null, { status: 204, headers: corsHeaders(preflightOrigin, preflightOrigin !== '*') });
     }
 
     // --- API Routes ---
@@ -654,23 +704,23 @@ export default {
         const body = JSON.parse(bodyResult.text) as TradeInput & { signature?: string; timestamp?: string };
 
         if (!body.type || !body.from_agent || !body.inscription_id) {
-          return json({ error: 'Missing required fields: type, from_agent, inscription_id' }, 400, origin);
+          return json({ error: 'Missing required fields: type, from_agent, inscription_id' }, 400, corsOrigin);
         }
 
         if (!['offer', 'counter', 'transfer', 'cancel', 'psbt_swap'].includes(body.type)) {
-          return json({ error: 'Invalid type. Must be: offer, counter, transfer, cancel, psbt_swap' }, 400, origin);
+          return json({ error: 'Invalid type. Must be: offer, counter, transfer, cancel, psbt_swap' }, 400, corsOrigin);
         }
 
         const authErr = await validateAuth(body as any);
-        if (authErr) return json({ error: authErr }, 401, origin);
+        if (authErr) return json({ error: authErr }, 401, corsOrigin);
 
         // Validate amount_sats if provided — must be a non-negative integer within BTC supply
         if (body.amount_sats !== undefined && body.amount_sats !== null) {
           if (!Number.isInteger(body.amount_sats) || body.amount_sats < 0) {
-            return json({ error: 'amount_sats must be a non-negative integer' }, 400, origin);
+            return json({ error: 'amount_sats must be a non-negative integer' }, 400, corsOrigin);
           }
           if (body.amount_sats > 2_100_000_000_000_000) {
-            return json({ error: 'amount_sats exceeds maximum (21M BTC)' }, 400, origin);
+            return json({ error: 'amount_sats exceeds maximum (21M BTC)' }, 400, corsOrigin);
           }
         }
 
@@ -683,18 +733,18 @@ export default {
         // Validate parent_trade_id before inserting
         if (body.parent_trade_id) {
           if (body.type === 'offer' || body.type === 'psbt_swap') {
-            return json({ error: `Trade type '${body.type}' cannot reference a parent_trade_id` }, 400, origin);
+            return json({ error: `Trade type '${body.type}' cannot reference a parent_trade_id` }, 400, corsOrigin);
           }
           const parent = await env.DB.prepare('SELECT id, from_agent, to_agent FROM trades WHERE id = ?').bind(body.parent_trade_id).first() as { id: number; from_agent: string; to_agent: string | null } | null;
           if (!parent) {
-            return json({ error: 'parent_trade_id does not exist' }, 400, origin);
+            return json({ error: 'parent_trade_id does not exist' }, 400, corsOrigin);
           }
           // Ownership check: only the seller (from_agent) or buyer (to_agent) of the parent trade
           // may cancel or counter it. Any other agent is rejected with 403.
           if (body.type === 'cancel' || body.type === 'counter') {
             const caller = body.from_agent;
             if (caller !== parent.from_agent && caller !== parent.to_agent) {
-              return json({ error: 'Forbidden: only a party to the original trade may cancel or counter it' }, 403, origin);
+              return json({ error: 'Forbidden: only a party to the original trade may cancel or counter it' }, 403, corsOrigin);
             }
           }
         }
@@ -753,9 +803,9 @@ export default {
           );
         }
 
-        return json({ success: true, trade_id: result.meta.last_row_id }, 201, origin);
+        return json({ success: true, trade_id: result.meta.last_row_id }, 201, corsOrigin);
       } catch (e: any) {
-        return json({ error: 'Internal server error' }, 500, origin);
+        return json({ error: 'Internal server error' }, 500, corsOrigin);
       }
     }
 
@@ -804,7 +854,7 @@ export default {
       return json({
         trades: trades.results,
         pagination: { total: count?.total || 0, limit, offset, hasMore: offset + limit < (count?.total || 0) }
-      }, 200, origin);
+      }, 200, corsOrigin);
     }
 
     // GET /api/trades/:id — Get single trade
@@ -821,7 +871,7 @@ export default {
         .bind(id)
         .first();
 
-      if (!trade) return json({ error: 'Trade not found' }, 404, origin);
+      if (!trade) return json({ error: 'Trade not found' }, 404, corsOrigin);
 
       // Get related trades (counters, transfers)
       const related = await env.DB
@@ -829,7 +879,7 @@ export default {
         .bind(id)
         .all();
 
-      return json({ trade, related: related.results }, 200, origin);
+      return json({ trade, related: related.results }, 200, corsOrigin);
     }
 
     // POST /api/agents/taproot — Register a taproot address for an agent
@@ -845,31 +895,31 @@ export default {
         };
 
         if (!body.btc_address || !body.taproot_address) {
-          return json({ error: 'Required: btc_address, taproot_address' }, 400, origin);
+          return json({ error: 'Required: btc_address, taproot_address' }, 400, corsOrigin);
         }
 
         if (!isValidBtcAddress(body.taproot_address) || !body.taproot_address.startsWith('bc1p')) {
-          return json({ error: 'taproot_address must be a valid taproot address (bc1p...)' }, 400, origin);
+          return json({ error: 'taproot_address must be a valid taproot address (bc1p...)' }, 400, corsOrigin);
         }
 
         // Auth: require BIP-137 signature
         if (!body.signature || !body.timestamp) {
-          return json({ error: 'Required: signature (BIP-137), timestamp (ISO 8601)' }, 401, origin);
+          return json({ error: 'Required: signature (BIP-137), timestamp (ISO 8601)' }, 401, corsOrigin);
         }
 
         const ts = new Date(body.timestamp).getTime();
         if (isNaN(ts) || Math.abs(Date.now() - ts) > 300_000) {
-          return json({ error: 'Timestamp expired or invalid (must be within 300s)' }, 401, origin);
+          return json({ error: 'Timestamp expired or invalid (must be within 300s)' }, 401, corsOrigin);
         }
 
         if (typeof body.signature !== 'string' || body.signature.length < 80 || body.signature.length > 100) {
-          return json({ error: 'Invalid signature format' }, 401, origin);
+          return json({ error: 'Invalid signature format' }, 401, corsOrigin);
         }
 
         // Cryptographic BIP-137 verification
         const taprootMsg = `ordinals-ledger | taproot | ${body.btc_address} | ${body.taproot_address} | ${body.timestamp}`;
         const taprootSigErr = await verifyBip137(body.signature, taprootMsg, body.btc_address);
-        if (taprootSigErr) return json({ error: taprootSigErr }, 401, origin);
+        if (taprootSigErr) return json({ error: taprootSigErr }, 401, corsOrigin);
 
         // Check agent exists
         const agent = await env.DB
@@ -888,9 +938,9 @@ export default {
           .bind(body.taproot_address, body.btc_address)
         );
 
-        return json({ success: true, btc_address: body.btc_address, taproot_address: body.taproot_address }, 200, origin);
+        return json({ success: true, btc_address: body.btc_address, taproot_address: body.taproot_address }, 200, corsOrigin);
       } catch (e: any) {
-        return json({ error: 'Internal server error' }, 500, origin);
+        return json({ error: 'Internal server error' }, 500, corsOrigin);
       }
     }
 
@@ -903,7 +953,7 @@ export default {
         .bind(limit, offset)
         .all();
       const total = await env.DB.prepare('SELECT COUNT(*) as count FROM agents').first<{ count: number }>();
-      return json({ agents: agents.results, pagination: { limit, offset, total: total?.count || 0 } }, 200, origin);
+      return json({ agents: agents.results, pagination: { limit, offset, total: total?.count || 0 } }, 200, corsOrigin);
     }
 
     // GET /api/stats — Ledger statistics
@@ -930,7 +980,7 @@ export default {
         psbt_swaps: (stats[6].results[0] as any)?.psbt_swaps || 0,
         active_listings: (stats[7].results[0] as any)?.active_listings || 0,
         total_listings: (stats[8].results[0] as any)?.total_listings || 0,
-      }, 200, origin);
+      }, 200, corsOrigin);
     }
 
     // GET /api/watcher/status — Watcher health and run info
@@ -954,7 +1004,7 @@ export default {
           total_inscriptions: snapshotStats?.total_inscriptions || 0,
           agents_with_taproot: taprootStats?.agents_with_taproot || 0,
         },
-      }, 200, origin);
+      }, 200, corsOrigin);
     }
 
     // --- Marketplace Listings ---
@@ -967,50 +1017,50 @@ export default {
         const body = JSON.parse(bodyResult.text) as any;
 
         if (!body.inscription_id || !body.seller_btc_address || !body.price_floor_sats) {
-          return json({ error: 'Required: inscription_id, seller_btc_address, price_floor_sats' }, 400, origin);
+          return json({ error: 'Required: inscription_id, seller_btc_address, price_floor_sats' }, 400, corsOrigin);
         }
 
         if (!isValidBtcAddress(body.seller_btc_address)) {
-          return json({ error: 'Invalid seller_btc_address: must be a valid Bitcoin address' }, 400, origin);
+          return json({ error: 'Invalid seller_btc_address: must be a valid Bitcoin address' }, 400, corsOrigin);
         }
         if (!isValidInscriptionId(body.inscription_id)) {
-          return json({ error: 'Invalid inscription_id: must be {64-hex-txid}i{number}' }, 400, origin);
+          return json({ error: 'Invalid inscription_id: must be {64-hex-txid}i{number}' }, 400, corsOrigin);
         }
         if (body.seller_stx_address && !isValidStxAddress(body.seller_stx_address)) {
-          return json({ error: 'Invalid seller_stx_address' }, 400, origin);
+          return json({ error: 'Invalid seller_stx_address' }, 400, corsOrigin);
         }
         if (body.seller_display_name && body.seller_display_name.length > MAX_DISPLAY_NAME) {
-          return json({ error: `seller_display_name exceeds ${MAX_DISPLAY_NAME} chars` }, 400, origin);
+          return json({ error: `seller_display_name exceeds ${MAX_DISPLAY_NAME} chars` }, 400, corsOrigin);
         }
         if (body.description && body.description.length > MAX_DESCRIPTION) {
-          return json({ error: `description exceeds ${MAX_DESCRIPTION} chars` }, 400, origin);
+          return json({ error: `description exceeds ${MAX_DESCRIPTION} chars` }, 400, corsOrigin);
         }
 
         if (typeof body.price_floor_sats !== 'number' || !Number.isInteger(body.price_floor_sats) || body.price_floor_sats <= 0) {
-          return json({ error: 'price_floor_sats must be a positive integer' }, 400, origin);
+          return json({ error: 'price_floor_sats must be a positive integer' }, 400, corsOrigin);
         }
         if (body.price_floor_sats > 2_100_000_000_000_000) {
-          return json({ error: 'price_floor_sats exceeds maximum (21M BTC)' }, 400, origin);
+          return json({ error: 'price_floor_sats exceeds maximum (21M BTC)' }, 400, corsOrigin);
         }
 
         // Auth: seller must sign
         if (!body.signature || !body.timestamp) {
-          return json({ error: 'Required: signature (BIP-137), timestamp (ISO 8601)' }, 401, origin);
+          return json({ error: 'Required: signature (BIP-137), timestamp (ISO 8601)' }, 401, corsOrigin);
         }
 
         const ts = new Date(body.timestamp).getTime();
         if (isNaN(ts) || Math.abs(Date.now() - ts) > 300_000) {
-          return json({ error: 'Timestamp expired or invalid (must be within 300s)' }, 401, origin);
+          return json({ error: 'Timestamp expired or invalid (must be within 300s)' }, 401, corsOrigin);
         }
 
         if (typeof body.signature !== 'string' || body.signature.length < 80 || body.signature.length > 100) {
-          return json({ error: 'Invalid signature format' }, 401, origin);
+          return json({ error: 'Invalid signature format' }, 401, corsOrigin);
         }
 
         // Cryptographic BIP-137 verification for listings
         const listingMsg = `ordinals-ledger | listing | ${body.seller_btc_address} | ${body.inscription_id} | ${body.timestamp}`;
         const listingSigErr = await verifyBip137(body.signature, listingMsg, body.seller_btc_address);
-        if (listingSigErr) return json({ error: listingSigErr }, 401, origin);
+        if (listingSigErr) return json({ error: listingSigErr }, 401, corsOrigin);
 
         // Check no active listing for same inscription by same seller
         const existing = await env.DB
@@ -1019,7 +1069,7 @@ export default {
           .first();
 
         if (existing) {
-          return json({ error: 'Active listing already exists for this inscription' }, 409, origin);
+          return json({ error: 'Active listing already exists for this inscription' }, 409, corsOrigin);
         }
 
         // Upsert seller agent
@@ -1036,14 +1086,14 @@ export default {
           );
         } catch (insertErr: any) {
           if (insertErr?.message?.includes('UNIQUE constraint')) {
-            return json({ error: 'Active listing already exists for this inscription' }, 409, origin);
+            return json({ error: 'Active listing already exists for this inscription' }, 409, corsOrigin);
           }
           throw insertErr;
         }
 
-        return json({ success: true, listing_id: result.meta.last_row_id }, 201, origin);
+        return json({ success: true, listing_id: result.meta.last_row_id }, 201, corsOrigin);
       } catch (e: any) {
-        return json({ error: 'Internal server error' }, 500, origin);
+        return json({ error: 'Internal server error' }, 500, corsOrigin);
       }
     }
 
@@ -1091,7 +1141,7 @@ export default {
       return json({
         listings: listings.results,
         pagination: { total: count?.total || 0, limit: lim, offset: off, hasMore: off + lim < (count?.total || 0) }
-      }, 200, origin);
+      }, 200, corsOrigin);
     }
 
     // PATCH /api/listings/:id — Update listing (delist or mark sold)
@@ -1103,30 +1153,30 @@ export default {
         const body = JSON.parse(bodyResult.text) as any;
 
         if (!body.status || !['delisted', 'sold'].includes(body.status)) {
-          return json({ error: 'status must be "delisted" or "sold"' }, 400, origin);
+          return json({ error: 'status must be "delisted" or "sold"' }, 400, corsOrigin);
         }
 
         // Auth required
         if (!body.signature || !body.timestamp || !body.seller_btc_address) {
-          return json({ error: 'Required: seller_btc_address, signature, timestamp' }, 401, origin);
+          return json({ error: 'Required: seller_btc_address, signature, timestamp' }, 401, corsOrigin);
         }
         if (!isValidBtcAddress(body.seller_btc_address)) {
-          return json({ error: 'Invalid seller_btc_address' }, 400, origin);
+          return json({ error: 'Invalid seller_btc_address' }, 400, corsOrigin);
         }
 
         const ts = new Date(body.timestamp).getTime();
         if (isNaN(ts) || Math.abs(Date.now() - ts) > 300_000) {
-          return json({ error: 'Timestamp expired or invalid' }, 401, origin);
+          return json({ error: 'Timestamp expired or invalid' }, 401, corsOrigin);
         }
 
         if (typeof body.signature !== 'string' || body.signature.length < 80 || body.signature.length > 100) {
-          return json({ error: 'Invalid signature format' }, 401, origin);
+          return json({ error: 'Invalid signature format' }, 401, corsOrigin);
         }
 
         // Cryptographic BIP-137 verification
         const delistMsg = `ordinals-ledger | delist | ${body.seller_btc_address} | ${id} | ${body.timestamp}`;
         const delistSigErr = await verifyBip137(body.signature, delistMsg, body.seller_btc_address);
-        if (delistSigErr) return json({ error: delistSigErr }, 401, origin);
+        if (delistSigErr) return json({ error: delistSigErr }, 401, corsOrigin);
 
         // Verify listing exists and seller matches
         const listing = await env.DB
@@ -1135,17 +1185,17 @@ export default {
           .first<any>();
 
         if (!listing) {
-          return json({ error: 'Listing not found or not active' }, 404, origin);
+          return json({ error: 'Listing not found or not active' }, 404, corsOrigin);
         }
 
         if (listing.seller_btc_address !== body.seller_btc_address) {
-          return json({ error: 'Only the seller can update this listing' }, 403, origin);
+          return json({ error: 'Only the seller can update this listing' }, 403, corsOrigin);
         }
 
         if (body.trade_id) {
           const trade = await env.DB.prepare('SELECT id FROM trades WHERE id = ?').bind(body.trade_id).first();
           if (!trade) {
-            return json({ error: 'trade_id does not exist' }, 400, origin);
+            return json({ error: 'trade_id does not exist' }, 400, corsOrigin);
           }
         }
 
@@ -1154,9 +1204,9 @@ export default {
           .bind(body.status, body.trade_id || null, id)
         );
 
-        return json({ success: true }, 200, origin);
+        return json({ success: true }, 200, corsOrigin);
       } catch (e: any) {
-        return json({ error: 'Internal server error' }, 500, origin);
+        return json({ error: 'Internal server error' }, 500, corsOrigin);
       }
     }
 
@@ -1167,10 +1217,10 @@ export default {
       });
     }
 
-    return json({ error: 'Not found' }, 404, origin);
+    return json({ error: 'Not found' }, 404, corsOrigin);
     } catch (e: any) {
       console.error('Unhandled error:', e?.message);
-      return json({ error: 'Internal server error' }, 500, origin);
+      return json({ error: 'Internal server error' }, 500, corsOrigin);
     }
   },
 
