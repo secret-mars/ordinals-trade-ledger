@@ -303,10 +303,47 @@ async function verifyBip137(signature: string, message: string, expectedAddress:
   return null; // verified
 }
 
+// --- Signature Replay Protection ---
+
+/** SHA-256 hex digest of an arbitrary string — used as the stored sig_hash key. */
+async function sha256Hex(input: string): Promise<string> {
+  const bytes = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(input));
+  return Array.from(new Uint8Array(bytes), b => b.toString(16).padStart(2, '0')).join('');
+}
+
+/**
+ * Attempt to record a signature as used.
+ * Returns null on success, or an error string if the signature was already used.
+ * The INSERT is a no-op on conflict (PRIMARY KEY), so concurrent races safely
+ * resolve to one winner and one loser rather than silently double-inserting.
+ */
+async function recordSignatureUse(db: D1Database, sigHash: string): Promise<string | null> {
+  const result = await db
+    .prepare('INSERT OR IGNORE INTO used_signatures (sig_hash) VALUES (?)')
+    .bind(sigHash)
+    .run();
+  // rows_written === 0 means the hash already existed → replay detected
+  if (result.meta.rows_written === 0) {
+    return 'Signature already used — replay detected (409 Conflict)';
+  }
+  return null;
+}
+
+/**
+ * Delete used_signatures rows older than 24 hours.
+ * Called lazily on each POST /api/trades and by the scheduled cron handler
+ * so the table never grows without bound.
+ */
+async function cleanupExpiredSignatures(db: D1Database): Promise<void> {
+  await db
+    .prepare("DELETE FROM used_signatures WHERE used_at < datetime('now', '-1 day')")
+    .run();
+}
+
 // Auth: require BIP-137 signature on all write endpoints
 // Signature message format: "ordinals-ledger | {type} | {from_agent} | {inscription_id} | {timestamp}"
 // Timestamp must be within 300 seconds of server time
-async function validateAuth(body: any): Promise<string | null> {
+async function validateAuth(body: any, db: D1Database): Promise<string | null> {
   if (!body.from_agent) return 'Required: from_agent';
   if (!isValidBtcAddress(body.from_agent)) return 'Invalid from_agent: must be a valid Bitcoin address';
   if (body.to_agent && !isValidBtcAddress(body.to_agent)) return 'Invalid to_agent: must be a valid Bitcoin address';
@@ -347,6 +384,15 @@ async function validateAuth(body: any): Promise<string | null> {
   const expectedMessage = `ordinals-ledger | ${body.type} | ${body.from_agent} | ${body.inscription_id || ''} | ${body.timestamp}`;
   const sigErr = await verifyBip137(body.signature, expectedMessage, body.from_agent);
   if (sigErr) return sigErr;
+
+  // Replay protection: hash the raw signature and attempt to record it as used.
+  // recordSignatureUse returns an error string if the hash already exists in D1
+  // (i.e., this exact signature was already accepted), which causes the request to
+  // be rejected with 409 Conflict from the caller. Cleanup of entries older than
+  // 24h is done lazily here so the table stays bounded without a separate job.
+  await cleanupExpiredSignatures(db);
+  const replayErr = await recordSignatureUse(db, await sha256Hex(body.signature));
+  if (replayErr) return replayErr;
 
   return null;
 }
@@ -711,8 +757,13 @@ export default {
           return json({ error: 'Invalid type. Must be: offer, counter, transfer, cancel, psbt_swap' }, 400, corsOrigin);
         }
 
-        const authErr = await validateAuth(body as any);
-        if (authErr) return json({ error: authErr }, 401, corsOrigin);
+        const authErr = await validateAuth(body as any, env.DB);
+        if (authErr) {
+          // Replay protection violations are surfaced as 409 Conflict, all other
+          // auth failures use 401 Unauthorized.
+          const status = authErr.includes('replay detected') ? 409 : 401;
+          return json({ error: authErr }, status, corsOrigin);
+        }
 
         // Validate amount_sats if provided — must be a non-negative integer within BTC supply
         if (body.amount_sats !== undefined && body.amount_sats !== null) {
@@ -1225,7 +1276,14 @@ export default {
   },
 
   async scheduled(controller: ScheduledController, env: Env, ctx: ExecutionContext) {
-    ctx.waitUntil(runWatcher(env));
+    // Run the on-chain watcher and clean up expired signature replay records
+    // together in each cron tick (every 5 minutes per wrangler.toml).
+    ctx.waitUntil(
+      Promise.all([
+        runWatcher(env),
+        cleanupExpiredSignatures(env.DB),
+      ])
+    );
   },
 };
 

@@ -47,6 +47,15 @@ CREATE TABLE IF NOT EXISTS watcher_runs (
   errors TEXT
 );
 
+-- Signature replay protection: stores a hash of each accepted BIP-137 signature.
+-- Prevents the same signed message from being replayed to create duplicate trades.
+-- Entries older than 24h are cleaned up lazily on each trade submission and by
+-- the scheduled watcher cron.
+CREATE TABLE IF NOT EXISTS used_signatures (
+  sig_hash TEXT PRIMARY KEY,
+  used_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
 CREATE INDEX IF NOT EXISTS idx_trades_type ON trades(type);
 CREATE INDEX IF NOT EXISTS idx_trades_from ON trades(from_agent);
 CREATE INDEX IF NOT EXISTS idx_trades_to ON trades(to_agent);
