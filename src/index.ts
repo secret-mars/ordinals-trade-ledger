@@ -295,9 +295,10 @@ async function verifyBip137(signature: string, message: string, expectedAddress:
     pubkey = point.toRawBytes(compressed);
   } catch { return 'Signature recovery failed: invalid signature for this message'; }
 
-  const derivedAddress = deriveAddress(pubkey, header);
-  if (derivedAddress !== expectedAddress) {
-    return `Signature mismatch: recovered ${derivedAddress}, expected ${expectedAddress}`;
+  const derivedAddress = deriveAddress(pubkey, header).toLowerCase();
+  const expectedAddressNorm = expectedAddress.toLowerCase();
+  if (derivedAddress !== expectedAddressNorm) {
+    return `Signature mismatch: recovered ${derivedAddress}, expected ${expectedAddressNorm}`;
   }
 
   return null; // verified
@@ -859,7 +860,13 @@ export default {
       try {
         const bodyResult = await readBodyWithSizeCheck(request);
         if ('error' in bodyResult) return bodyResult.error;
-        const body = JSON.parse(bodyResult.text) as TradeInput & { signature?: string; timestamp?: string };
+
+        let body: TradeInput & { signature?: string; timestamp?: string };
+        try {
+          body = JSON.parse(bodyResult.text);
+        } catch {
+          return json({ error: 'Invalid JSON in request body' }, 400, corsOrigin);
+        }
 
         if (!body.type || !body.from_agent || !body.inscription_id) {
           return json({ error: 'Missing required fields: type, from_agent, inscription_id' }, 400, corsOrigin);
@@ -877,7 +884,10 @@ export default {
           return json({ error: authErr }, status, corsOrigin);
         }
 
-        // Validate amount_sats if provided — must be a non-negative integer within BTC supply
+        // Validate amount_sats if provided — must be a non-negative integer within BTC supply.
+        // Zero-satoshi trades (amount_sats === 0) are intentionally allowed: they represent
+        // gifted inscriptions, internal transfers, or trades where the price is agreed
+        // off-chain. Callers may enforce a minimum price in their own business logic.
         if (body.amount_sats !== undefined && body.amount_sats !== null) {
           if (!Number.isInteger(body.amount_sats) || body.amount_sats < 0) {
             return json({ error: 'amount_sats must be a non-negative integer' }, 400, corsOrigin);
