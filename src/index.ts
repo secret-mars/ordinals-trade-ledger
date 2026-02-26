@@ -340,6 +340,111 @@ async function cleanupExpiredSignatures(db: D1Database): Promise<void> {
     .run();
 }
 
+// --- IP-Based Rate Limiting ---
+
+const RATE_LIMIT_WINDOW_SECONDS = 300; // 5-minute window
+const RATE_LIMIT_MAX_REQUESTS = 10;    // max requests per IP per endpoint per window
+
+/**
+ * Extract the client IP from a Cloudflare Workers request.
+ * CF-Connecting-IP is set by Cloudflare and cannot be spoofed by the client.
+ * Falls back to a sentinel so the rate limiter still functions without it.
+ */
+function getClientIp(request: Request): string {
+  return request.headers.get('CF-Connecting-IP') ?? 'unknown';
+}
+
+/**
+ * Derive a canonical endpoint key from the request URL path.
+ * Uses the first two path segments (e.g. "/api/trades") so that
+ * parameterised paths like /api/listings/42 bucket together.
+ */
+function endpointKey(pathname: string): string {
+  const parts = pathname.split('/').filter(Boolean);
+  return '/' + parts.slice(0, 2).join('/');
+}
+
+/**
+ * Check and increment the rate limit counter for this IP + endpoint.
+ *
+ * Uses a 5-minute fixed window aligned to wall-clock time (truncated to the
+ * nearest 5-minute boundary). On each call:
+ *   1. DELETE expired windows (lazy cleanup) — keeps the table bounded.
+ *   2. INSERT the current window row or increment its counter atomically
+ *      using INSERT OR REPLACE (upsert).
+ *   3. Read back the counter. If it exceeds the limit return 429.
+ *
+ * Returns null if the request is allowed, or a Response (429) if rate limited.
+ */
+async function checkRateLimit(db: D1Database, request: Request): Promise<Response | null> {
+  const ip = getClientIp(request);
+  const endpoint = endpointKey(new URL(request.url).pathname);
+
+  // Compute the start of the current 5-minute window (truncated to whole windows)
+  const now = Math.floor(Date.now() / 1000);
+  const windowStart = now - (now % RATE_LIMIT_WINDOW_SECONDS);
+  const windowStartIso = new Date(windowStart * 1000).toISOString();
+
+  // Lazy cleanup: remove rows from windows older than the current window
+  // (i.e., started before the current window boundary).
+  await db
+    .prepare('DELETE FROM rate_limits WHERE window_start < ?')
+    .bind(windowStartIso)
+    .run();
+
+  // Atomically upsert: insert the row for this window, or increment if it
+  // already exists. D1 executes this as a single statement with no TOCTOU gap.
+  await db
+    .prepare(
+      `INSERT INTO rate_limits (ip, endpoint, window_start, request_count)
+       VALUES (?, ?, ?, 1)
+       ON CONFLICT(ip, endpoint, window_start) DO UPDATE
+         SET request_count = request_count + 1`
+    )
+    .bind(ip, endpoint, windowStartIso)
+    .run();
+
+  // Read back the count to decide whether to allow or reject
+  const row = await db
+    .prepare('SELECT request_count FROM rate_limits WHERE ip = ? AND endpoint = ? AND window_start = ?')
+    .bind(ip, endpoint, windowStartIso)
+    .first<{ request_count: number }>();
+
+  const count = row?.request_count ?? 1;
+  if (count > RATE_LIMIT_MAX_REQUESTS) {
+    // Seconds until the current window expires
+    const windowEnd = windowStart + RATE_LIMIT_WINDOW_SECONDS;
+    const retryAfter = Math.max(0, windowEnd - now);
+    return new Response(JSON.stringify({ error: 'Too many requests — try again later' }), {
+      status: 429,
+      headers: {
+        'Content-Type': 'application/json',
+        'Retry-After': String(retryAfter),
+        'X-RateLimit-Limit': String(RATE_LIMIT_MAX_REQUESTS),
+        'X-RateLimit-Window': `${RATE_LIMIT_WINDOW_SECONDS}s`,
+      },
+    });
+  }
+
+  return null; // request is within limit
+}
+
+/**
+ * Delete rate_limits rows from expired windows.
+ * Called by the scheduled cron handler to keep the table bounded.
+ * Lazy cleanup on each write request handles the common case; this
+ * catches any stragglers (e.g., IPs that stopped sending requests).
+ */
+async function cleanupExpiredRateLimits(db: D1Database): Promise<void> {
+  const now = Math.floor(Date.now() / 1000);
+  const currentWindowStart = now - (now % RATE_LIMIT_WINDOW_SECONDS);
+  const currentWindowStartIso = new Date(currentWindowStart * 1000).toISOString();
+  await db
+    .prepare('DELETE FROM rate_limits WHERE window_start < ?')
+    .bind(currentWindowStartIso)
+    .run();
+}
+
 // Auth: require BIP-137 signature on all write endpoints
 // Signature message format: "ordinals-ledger | {type} | {from_agent} | {inscription_id} | {timestamp}"
 // Timestamp must be within 300 seconds of server time
@@ -738,6 +843,13 @@ export default {
         return new Response(null, { status: 204 });
       }
       return new Response(null, { status: 204, headers: corsHeaders(preflightOrigin, preflightOrigin !== '*') });
+    }
+
+    // Rate limit write methods (POST, PUT, PATCH, DELETE) — not reads.
+    // Checked once here so every write endpoint is automatically protected.
+    if (WRITE_METHODS.has(request.method)) {
+      const rateLimitResponse = await checkRateLimit(env.DB, request);
+      if (rateLimitResponse) return rateLimitResponse;
     }
 
     // --- API Routes ---
@@ -1276,12 +1388,14 @@ export default {
   },
 
   async scheduled(controller: ScheduledController, env: Env, ctx: ExecutionContext) {
-    // Run the on-chain watcher and clean up expired signature replay records
-    // together in each cron tick (every 5 minutes per wrangler.toml).
+    // Run the on-chain watcher, clean up expired signature replay records,
+    // and prune expired rate limit windows — all in each cron tick (every 5
+    // minutes per wrangler.toml).
     ctx.waitUntil(
       Promise.all([
         runWatcher(env),
         cleanupExpiredSignatures(env.DB),
+        cleanupExpiredRateLimits(env.DB),
       ])
     );
   },
