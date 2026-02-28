@@ -5,6 +5,7 @@ CREATE TABLE IF NOT EXISTS agents (
   btc_address TEXT PRIMARY KEY,
   stx_address TEXT,
   display_name TEXT,
+  taproot_address TEXT,
   first_seen TEXT NOT NULL DEFAULT (datetime('now')),
   trade_count INTEGER NOT NULL DEFAULT 0
 );
