@@ -539,7 +539,7 @@ async function fetchAgentInscriptions(address: string, unisatApiKey?: string): P
 
   for (let page = 0; page < maxPages; page++) {
     const url = `https://open-api.unisat.io/v1/indexer/address/${encodeURIComponent(address)}/inscription-data?cursor=${cursor}&size=${perPage}`;
-    const resp = await fetch(url, { headers });
+    const resp = await fetch(url, { headers, signal: AbortSignal.timeout(15000) });
     if (!resp.ok) {
       throw new Error(`Unisat API ${resp.status}: ${resp.statusText}`);
     }
@@ -1069,6 +1069,10 @@ export default {
 
         if (!body.btc_address || !body.taproot_address) {
           return json({ error: 'Required: btc_address, taproot_address' }, 400, corsOrigin);
+        }
+
+        if (!isValidBtcAddress(body.btc_address)) {
+          return json({ error: 'Invalid btc_address format' }, 400, corsOrigin);
         }
 
         if (!isValidBtcAddress(body.taproot_address) || !body.taproot_address.startsWith('bc1p')) {
