@@ -1060,12 +1060,13 @@ export default {
       try {
         const bodyResult = await readBodyWithSizeCheck(request);
         if ('error' in bodyResult) return bodyResult.error;
-        const body = JSON.parse(bodyResult.text) as {
-          btc_address?: string;
-          taproot_address?: string;
-          signature?: string;
-          timestamp?: string;
-        };
+
+        let body: { btc_address?: string; taproot_address?: string; signature?: string; timestamp?: string };
+        try {
+          body = JSON.parse(bodyResult.text);
+        } catch {
+          return json({ error: 'Invalid JSON in request body' }, 400, corsOrigin);
+        }
 
         if (!body.btc_address || !body.taproot_address) {
           return json({ error: 'Required: btc_address, taproot_address' }, 400, corsOrigin);
@@ -1093,6 +1094,13 @@ export default {
         const taprootMsg = `ordinals-ledger | taproot | ${body.btc_address} | ${body.taproot_address} | ${body.timestamp}`;
         const taprootSigErr = await verifyBip137(body.signature, taprootMsg, body.btc_address);
         if (taprootSigErr) return json({ error: taprootSigErr }, 401, corsOrigin);
+
+        // Replay protection: reject signatures that have already been used.
+        // Cleanup of entries older than 24h is done lazily so the table stays bounded.
+        await cleanupExpiredSignatures(env.DB);
+        const sigHash = await sha256Hex(body.signature!);
+        const replayErr = await recordSignatureUse(env.DB, sigHash);
+        if (replayErr) return json({ error: replayErr }, 409, corsOrigin);
 
         // Check agent exists
         const agent = await env.DB
@@ -1323,7 +1331,13 @@ export default {
         const id = parseInt(path.split('/').pop()!);
         const bodyResult = await readBodyWithSizeCheck(request);
         if ('error' in bodyResult) return bodyResult.error;
-        const body = JSON.parse(bodyResult.text) as any;
+
+        let body: any;
+        try {
+          body = JSON.parse(bodyResult.text);
+        } catch {
+          return json({ error: 'Invalid JSON in request body' }, 400, corsOrigin);
+        }
 
         if (!body.status || !['delisted', 'sold'].includes(body.status)) {
           return json({ error: 'status must be "delisted" or "sold"' }, 400, corsOrigin);
