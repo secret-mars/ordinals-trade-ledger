@@ -8,7 +8,9 @@
     "db:create": "wrangler d1 create ordinals-trade-ledger",
     "db:migrate": "wrangler d1 execute ordinals-trade-ledger --file=src/schema.sql",
     "db:migrate:001": "wrangler d1 execute ordinals-trade-ledger --local --file=src/migration-001.sql",
-    "db:migrate:001:remote": "wrangler d1 execute ordinals-trade-ledger --remote --file=src/migration-001.sql"
+    "db:migrate:001:remote": "wrangler d1 execute ordinals-trade-ledger --remote --file=src/migration-001.sql",
+    "db:migrate:006": "wrangler d1 execute ordinals-trade-ledger --local --file=src/migration-006.sql",
+    "db:migrate:006:remote": "wrangler d1 execute ordinals-trade-ledger --remote --file=src/migration-006.sql"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^4.20241205.0",

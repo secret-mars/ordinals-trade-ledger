@@ -1060,12 +1060,17 @@ export default {
       try {
         const bodyResult = await readBodyWithSizeCheck(request);
         if ('error' in bodyResult) return bodyResult.error;
-        const body = JSON.parse(bodyResult.text) as {
+        let body: {
           btc_address?: string;
           taproot_address?: string;
           signature?: string;
           timestamp?: string;
         };
+        try {
+          body = JSON.parse(bodyResult.text);
+        } catch {
+          return json({ error: 'Invalid JSON in request body' }, 400, corsOrigin);
+        }
 
         if (!body.btc_address || !body.taproot_address) {
           return json({ error: 'Required: btc_address, taproot_address' }, 400, corsOrigin);
@@ -1113,6 +1118,7 @@ export default {
 
         return json({ success: true, btc_address: body.btc_address, taproot_address: body.taproot_address }, 200, corsOrigin);
       } catch (e: any) {
+        console.error('POST /api/agents/taproot failed', e);
         return json({ error: 'Internal server error' }, 500, corsOrigin);
       }
     }
@@ -1187,7 +1193,12 @@ export default {
       try {
         const bodyResult = await readBodyWithSizeCheck(request);
         if ('error' in bodyResult) return bodyResult.error;
-        const body = JSON.parse(bodyResult.text) as any;
+        let body: any;
+        try {
+          body = JSON.parse(bodyResult.text);
+        } catch {
+          return json({ error: 'Invalid JSON in request body' }, 400, corsOrigin);
+        }
 
         if (!body.inscription_id || !body.seller_btc_address || !body.price_floor_sats) {
           return json({ error: 'Required: inscription_id, seller_btc_address, price_floor_sats' }, 400, corsOrigin);
@@ -1266,6 +1277,7 @@ export default {
 
         return json({ success: true, listing_id: result.meta.last_row_id }, 201, corsOrigin);
       } catch (e: any) {
+        console.error('POST /api/listings failed', e);
         return json({ error: 'Internal server error' }, 500, corsOrigin);
       }
     }
@@ -1323,7 +1335,12 @@ export default {
         const id = parseInt(path.split('/').pop()!);
         const bodyResult = await readBodyWithSizeCheck(request);
         if ('error' in bodyResult) return bodyResult.error;
-        const body = JSON.parse(bodyResult.text) as any;
+        let body: any;
+        try {
+          body = JSON.parse(bodyResult.text);
+        } catch {
+          return json({ error: 'Invalid JSON in request body' }, 400, corsOrigin);
+        }
 
         if (!body.status || !['delisted', 'sold'].includes(body.status)) {
           return json({ error: 'status must be "delisted" or "sold"' }, 400, corsOrigin);
@@ -1379,6 +1396,7 @@ export default {
 
         return json({ success: true }, 200, corsOrigin);
       } catch (e: any) {
+        console.error('PATCH /api/listings/:id failed', e);
         return json({ error: 'Internal server error' }, 500, corsOrigin);
       }
     }
