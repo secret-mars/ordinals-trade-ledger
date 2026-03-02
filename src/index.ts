@@ -45,7 +45,9 @@ const WRITE_METHODS = new Set(['POST', 'PUT', 'PATCH', 'DELETE']);
  */
 function resolveCorsOrigin(requestOrigin: string | null, isWrite: boolean): string | null {
   if (!isWrite) return '*';
-  if (!requestOrigin) return null;
+  // No Origin header = not a browser request (curl, agent, server-to-server) = safe to allow.
+  // CORS restrictions only apply to browser cross-origin requests.
+  if (!requestOrigin) return '*';
 
   // Allow exact production origins
   if ((WRITE_ALLOWED_ORIGINS as string[]).includes(requestOrigin)) return requestOrigin;
