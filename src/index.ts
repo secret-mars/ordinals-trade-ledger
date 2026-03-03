@@ -1166,6 +1166,54 @@ export default {
       }, 200, corsOrigin);
     }
 
+    // GET /api/metrics — Activity metrics: daily trade/agent/volume trends (last 7 days)
+    if (request.method === 'GET' && path === '/api/metrics') {
+      const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000)
+        .toISOString()
+        .slice(0, 10);
+
+      const [tradesByDay, agentsByDay, volumeByDay, tradesByType, topAgents] =
+        await env.DB.batch([
+          env.DB.prepare(
+            `SELECT DATE(created_at) as date, COUNT(*) as count
+             FROM trades WHERE created_at >= ?
+             GROUP BY DATE(created_at) ORDER BY date DESC`
+          ).bind(sevenDaysAgo),
+          env.DB.prepare(
+            `SELECT DATE(first_seen) as date, COUNT(*) as count
+             FROM agents WHERE first_seen >= ?
+             GROUP BY DATE(first_seen) ORDER BY date DESC`
+          ).bind(sevenDaysAgo),
+          env.DB.prepare(
+            `SELECT DATE(created_at) as date, COALESCE(SUM(amount_sats), 0) as volume_sats
+             FROM trades WHERE status = 'completed' AND created_at >= ?
+             GROUP BY DATE(created_at) ORDER BY date DESC`
+          ).bind(sevenDaysAgo),
+          env.DB.prepare(
+            `SELECT type, COUNT(*) as count FROM trades
+             GROUP BY type ORDER BY count DESC`
+          ),
+          env.DB.prepare(
+            `SELECT btc_address, display_name, trade_count
+             FROM agents ORDER BY trade_count DESC LIMIT 10`
+          ),
+        ]);
+
+      return json(
+        {
+          period: '7d',
+          generated_at: new Date().toISOString(),
+          trades_by_day: tradesByDay.results,
+          agents_by_day: agentsByDay.results,
+          volume_by_day: volumeByDay.results,
+          trades_by_type: tradesByType.results,
+          top_agents_by_activity: topAgents.results,
+        },
+        200,
+        corsOrigin,
+      );
+    }
+
     // GET /api/watcher/status — Watcher health and run info
     if (request.method === 'GET' && path === '/api/watcher/status') {
       const lastRun = await env.DB
