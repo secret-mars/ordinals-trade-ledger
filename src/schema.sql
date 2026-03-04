@@ -20,7 +20,7 @@ CREATE TABLE IF NOT EXISTS trades (
   tx_hash TEXT,
   parent_trade_id INTEGER REFERENCES trades(id),
   metadata TEXT,
-  source TEXT DEFAULT 'manual',
+  source TEXT DEFAULT 'manual' CHECK (source IN ('watcher', 'manual', 'api')),
   created_at TEXT NOT NULL DEFAULT (datetime('now')),
   updated_at TEXT NOT NULL DEFAULT (datetime('now')),
   FOREIGN KEY (from_agent) REFERENCES agents(btc_address),
