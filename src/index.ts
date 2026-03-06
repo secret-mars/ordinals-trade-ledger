@@ -306,6 +306,194 @@ async function verifyBip137(signature: string, message: string, expectedAddress:
   return null; // verified
 }
 
+// --- BIP-322 Signature Verification (P2WPKH / native SegWit) ---
+
+function sha256d(data: Uint8Array): Uint8Array {
+  return sha256(sha256(data));
+}
+
+function bip322MessageHash(message: string): Uint8Array {
+  const tag = sha256(new TextEncoder().encode('BIP0322-signed-message'));
+  const msgBytes = new TextEncoder().encode(message);
+  const buf = new Uint8Array(tag.length * 2 + msgBytes.length);
+  buf.set(tag, 0);
+  buf.set(tag, tag.length);
+  buf.set(msgBytes, tag.length * 2);
+  return sha256(buf);
+}
+
+function buildToSpendTx(message: string, scriptPubKey: Uint8Array): Uint8Array {
+  const messageHash = bip322MessageHash(message);
+  // scriptSig: OP_0 OP_PUSH32 <message_hash>
+  const scriptSig = new Uint8Array(34);
+  scriptSig[0] = 0x00; // OP_0
+  scriptSig[1] = 0x20; // OP_PUSH32
+  scriptSig.set(messageHash, 2);
+
+  const parts: Uint8Array[] = [];
+  parts.push(new Uint8Array([0x00, 0x00, 0x00, 0x00]));           // version 0
+  parts.push(new Uint8Array([0x01]));                              // 1 input
+  parts.push(new Uint8Array(32));                                  // prevout txid: all zeros
+  parts.push(new Uint8Array([0xFF, 0xFF, 0xFF, 0xFF]));           // prevout index: 0xFFFFFFFF
+  parts.push(encodeVarint(scriptSig.length));
+  parts.push(scriptSig);
+  parts.push(new Uint8Array([0x00, 0x00, 0x00, 0x00]));           // sequence 0
+  parts.push(new Uint8Array([0x01]));                              // 1 output
+  parts.push(new Uint8Array(8));                                   // value 0
+  parts.push(encodeVarint(scriptPubKey.length));
+  parts.push(scriptPubKey);
+  parts.push(new Uint8Array([0x00, 0x00, 0x00, 0x00]));           // locktime 0
+
+  let total = 0;
+  for (const p of parts) total += p.length;
+  const tx = new Uint8Array(total);
+  let off = 0;
+  for (const p of parts) { tx.set(p, off); off += p.length; }
+  return tx;
+}
+
+function bip143Sighash(toSpendTxid: Uint8Array, pubkeyHash: Uint8Array): Uint8Array {
+  // outpoint: toSpendTxid + index 0
+  const outpoint = new Uint8Array(36);
+  outpoint.set(toSpendTxid, 0); // index 0 is already zero bytes
+
+  const hashPrevouts = sha256d(outpoint);
+
+  const seqBytes = new Uint8Array([0x00, 0x00, 0x00, 0x00]);
+  const hashSequence = sha256d(seqBytes);
+
+  // output: value=0 (8 bytes) + OP_RETURN
+  const outputData = new Uint8Array(10);
+  outputData[8] = 0x01; // scriptPubKey length
+  outputData[9] = 0x6a; // OP_RETURN
+  const hashOutputs = sha256d(outputData);
+
+  // scriptCode: OP_DUP OP_HASH160 <20> OP_EQUALVERIFY OP_CHECKSIG
+  const scriptCode = new Uint8Array(25);
+  scriptCode[0] = 0x76; scriptCode[1] = 0xa9; scriptCode[2] = 0x14;
+  scriptCode.set(pubkeyHash, 3);
+  scriptCode[23] = 0x88; scriptCode[24] = 0xac;
+
+  const parts: Uint8Array[] = [];
+  parts.push(new Uint8Array([0x00, 0x00, 0x00, 0x00]));           // version 0
+  parts.push(hashPrevouts);
+  parts.push(hashSequence);
+  parts.push(outpoint);
+  parts.push(encodeVarint(scriptCode.length));
+  parts.push(scriptCode);
+  parts.push(new Uint8Array(8));                                   // value 0
+  parts.push(seqBytes);                                            // sequence 0
+  parts.push(hashOutputs);
+  parts.push(new Uint8Array([0x00, 0x00, 0x00, 0x00]));           // locktime 0
+  parts.push(new Uint8Array([0x01, 0x00, 0x00, 0x00]));           // SIGHASH_ALL
+
+  let total = 0;
+  for (const p of parts) total += p.length;
+  const preimage = new Uint8Array(total);
+  let off = 0;
+  for (const p of parts) { preimage.set(p, off); off += p.length; }
+  return sha256d(preimage);
+}
+
+function parseDER(der: Uint8Array): { r: bigint; s: bigint } | null {
+  if (der[0] !== 0x30) return null;
+  let pos = 2;
+  if (der[pos] !== 0x02) return null; pos++;
+  const rLen = der[pos]; pos++;
+  const rBytes = der.slice(pos, pos + rLen); pos += rLen;
+  if (der[pos] !== 0x02) return null; pos++;
+  const sLen = der[pos]; pos++;
+  const sBytes = der.slice(pos, pos + sLen);
+  return {
+    r: BigInt('0x' + Array.from(rBytes, b => b.toString(16).padStart(2, '0')).join('')),
+    s: BigInt('0x' + Array.from(sBytes, b => b.toString(16).padStart(2, '0')).join('')),
+  };
+}
+
+async function verifyBip322P2WPKH(signature: string, message: string, expectedAddress: string): Promise<string | null> {
+  let sigBytes: Uint8Array;
+  try {
+    sigBytes = Uint8Array.from(atob(signature), c => c.charCodeAt(0));
+  } catch { return 'Invalid signature: not valid base64'; }
+
+  // Parse witness: num_items + [varint_len + data, ...]
+  let pos = 0;
+  const numItems = sigBytes[pos]; pos++;
+  if (numItems !== 2) return `BIP-322: expected 2 witness items, got ${numItems}`;
+
+  const sigItemLen = sigBytes[pos]; pos++;
+  const derSig = sigBytes.slice(pos, pos + sigItemLen); pos += sigItemLen;
+
+  const pkLen = sigBytes[pos]; pos++;
+  const pubkey = sigBytes.slice(pos, pos + pkLen);
+
+  if (pkLen !== 33) return `BIP-322: expected 33-byte compressed pubkey, got ${pkLen}`;
+
+  // Verify pubkey matches expected address
+  const derivedAddress = pubkeyToBech32(pubkey);
+  if (derivedAddress.toLowerCase() !== expectedAddress.toLowerCase()) {
+    return `BIP-322: address mismatch: derived ${derivedAddress}, expected ${expectedAddress}`;
+  }
+
+  // Strip SIGHASH_ALL byte from DER sig if present
+  let derData = derSig;
+  if (derData[derData.length - 1] === 0x01) {
+    derData = derData.slice(0, -1);
+  }
+
+  const rs = parseDER(derData);
+  if (!rs) return 'BIP-322: invalid DER signature encoding';
+
+  // Build to_spend transaction and compute its txid
+  const pubkeyHash = ripemd160(sha256(pubkey));
+  const scriptPubKey = new Uint8Array(22);
+  scriptPubKey[0] = 0x00; // witness version 0
+  scriptPubKey[1] = 0x14; // push 20 bytes
+  scriptPubKey.set(pubkeyHash, 2);
+
+  const toSpendTx = buildToSpendTx(message, scriptPubKey);
+  const toSpendId = sha256d(toSpendTx);
+
+  // Compute BIP-143 sighash for the virtual to_sign transaction
+  const sighash = bip143Sighash(toSpendId, pubkeyHash);
+
+  // Verify ECDSA: convert r,s to 64-byte compact format
+  const rHex = rs.r.toString(16).padStart(64, '0');
+  const sHex = rs.s.toString(16).padStart(64, '0');
+  const compactSig = new Uint8Array(64);
+  for (let i = 0; i < 32; i++) compactSig[i] = parseInt(rHex.slice(i * 2, i * 2 + 2), 16);
+  for (let i = 0; i < 32; i++) compactSig[32 + i] = parseInt(sHex.slice(i * 2, i * 2 + 2), 16);
+
+  try {
+    const valid = secp.verify(compactSig, sighash, pubkey);
+    if (!valid) return 'BIP-322: ECDSA verification failed';
+  } catch (e: any) {
+    return `BIP-322: verification error: ${e.message}`;
+  }
+
+  return null;
+}
+
+// Unified signature verification: auto-detects BIP-137 vs BIP-322
+async function verifySignature(signature: string, message: string, expectedAddress: string): Promise<string | null> {
+  let sigBytes: Uint8Array;
+  try {
+    sigBytes = Uint8Array.from(atob(signature), c => c.charCodeAt(0));
+  } catch { return 'Invalid signature: not valid base64'; }
+
+  // BIP-137: exactly 65 bytes, header byte 27-42
+  if (sigBytes.length === 65 && sigBytes[0] >= 27 && sigBytes[0] <= 42) {
+    return verifyBip137(signature, message, expectedAddress);
+  }
+
+  // BIP-322 P2WPKH: witness-serialized, starts with 0x02 (2 witness items)
+  if (sigBytes.length > 65 && sigBytes[0] === 0x02) {
+    return verifyBip322P2WPKH(signature, message, expectedAddress);
+  }
+
+  return `Unrecognized signature format (${sigBytes.length} bytes, header: ${sigBytes[0]})`;
+}
+
 // --- Signature Replay Protection ---
 
 /** SHA-256 hex digest of an arbitrary string — used as the stored sig_hash key. */
@@ -448,7 +636,7 @@ async function cleanupExpiredRateLimits(db: D1Database): Promise<void> {
     .run();
 }
 
-// Auth: require BIP-137 signature on all write endpoints
+// Auth: require BIP-137 or BIP-322 signature on all write endpoints
 // Signature message format: "ordinals-ledger | {type} | {from_agent} | {inscription_id} | {timestamp}"
 // Timestamp must be within 300 seconds of server time
 async function validateAuth(body: any, db: D1Database): Promise<string | null> {
@@ -462,12 +650,12 @@ async function validateAuth(body: any, db: D1Database): Promise<string | null> {
   if (body.from_display_name && body.from_display_name.length > MAX_DISPLAY_NAME) return `from_display_name exceeds ${MAX_DISPLAY_NAME} chars`;
   if (body.to_display_name && body.to_display_name.length > MAX_DISPLAY_NAME) return `to_display_name exceeds ${MAX_DISPLAY_NAME} chars`;
   if (body.metadata && body.metadata.length > MAX_METADATA) return `metadata exceeds ${MAX_METADATA} chars`;
-  if (!body.signature) return 'Required: signature (BIP-137 signed message)';
+  if (!body.signature) return 'Required: signature (BIP-137 or BIP-322 signed message)';
   if (!body.timestamp) return 'Required: timestamp (ISO 8601)';
 
-  // Validate signature format (base64-encoded BIP-137 = 88 chars)
-  if (typeof body.signature !== 'string' || body.signature.length < 80 || body.signature.length > 100) {
-    return 'Invalid signature format (expected base64 BIP-137, ~88 chars)';
+  // Validate signature format (base64: BIP-137 ~88 chars, BIP-322 ~100-200 chars)
+  if (typeof body.signature !== 'string' || body.signature.length < 80 || body.signature.length > 300) {
+    return 'Invalid signature format (expected base64 BIP-137 or BIP-322)';
   }
 
   // Validate timestamp is recent (within 300 seconds)
@@ -488,9 +676,9 @@ async function validateAuth(body: any, db: D1Database): Promise<string | null> {
     return 'PSBT swaps require to_agent (the counterparty)';
   }
 
-  // Cryptographic BIP-137 signature verification
+  // Cryptographic signature verification (BIP-137 or BIP-322)
   const expectedMessage = `ordinals-ledger | ${body.type} | ${body.from_agent} | ${body.inscription_id || ''} | ${body.timestamp}`;
-  const sigErr = await verifyBip137(body.signature, expectedMessage, body.from_agent);
+  const sigErr = await verifySignature(body.signature, expectedMessage, body.from_agent);
   if (sigErr) return sigErr;
 
   // Replay protection: hash the raw signature and attempt to record it as used.
@@ -1078,9 +1266,9 @@ export default {
           return json({ error: 'taproot_address must be a valid taproot address (bc1p...)' }, 400, corsOrigin);
         }
 
-        // Auth: require BIP-137 signature
+        // Auth: require signature (BIP-137 or BIP-322)
         if (!body.signature || !body.timestamp) {
-          return json({ error: 'Required: signature (BIP-137), timestamp (ISO 8601)' }, 401, corsOrigin);
+          return json({ error: 'Required: signature (BIP-137 or BIP-322), timestamp (ISO 8601)' }, 401, corsOrigin);
         }
 
         const ts = new Date(body.timestamp).getTime();
@@ -1088,13 +1276,13 @@ export default {
           return json({ error: 'Timestamp expired or invalid (must be within 300s)' }, 401, corsOrigin);
         }
 
-        if (typeof body.signature !== 'string' || body.signature.length < 80 || body.signature.length > 100) {
+        if (typeof body.signature !== 'string' || body.signature.length < 80 || body.signature.length > 300) {
           return json({ error: 'Invalid signature format' }, 401, corsOrigin);
         }
 
-        // Cryptographic BIP-137 verification
+        // Cryptographic signature verification (BIP-137 or BIP-322)
         const taprootMsg = `ordinals-ledger | taproot | ${body.btc_address} | ${body.taproot_address} | ${body.timestamp}`;
-        const taprootSigErr = await verifyBip137(body.signature, taprootMsg, body.btc_address);
+        const taprootSigErr = await verifySignature(body.signature, taprootMsg, body.btc_address);
         if (taprootSigErr) return json({ error: taprootSigErr }, 401, corsOrigin);
 
         // Replay protection: reject signatures that have already been used.
@@ -1276,7 +1464,7 @@ export default {
 
         // Auth: seller must sign
         if (!body.signature || !body.timestamp) {
-          return json({ error: 'Required: signature (BIP-137), timestamp (ISO 8601)' }, 401, corsOrigin);
+          return json({ error: 'Required: signature (BIP-137 or BIP-322), timestamp (ISO 8601)' }, 401, corsOrigin);
         }
 
         const ts = new Date(body.timestamp).getTime();
@@ -1284,13 +1472,13 @@ export default {
           return json({ error: 'Timestamp expired or invalid (must be within 300s)' }, 401, corsOrigin);
         }
 
-        if (typeof body.signature !== 'string' || body.signature.length < 80 || body.signature.length > 100) {
+        if (typeof body.signature !== 'string' || body.signature.length < 80 || body.signature.length > 300) {
           return json({ error: 'Invalid signature format' }, 401, corsOrigin);
         }
 
-        // Cryptographic BIP-137 verification for listings
+        // Cryptographic signature verification (BIP-137 or BIP-322)
         const listingMsg = `ordinals-ledger | listing | ${body.seller_btc_address} | ${body.inscription_id} | ${body.timestamp}`;
-        const listingSigErr = await verifyBip137(body.signature, listingMsg, body.seller_btc_address);
+        const listingSigErr = await verifySignature(body.signature, listingMsg, body.seller_btc_address);
         if (listingSigErr) return json({ error: listingSigErr }, 401, corsOrigin);
 
         // Check no active listing for same inscription by same seller
@@ -1406,13 +1594,13 @@ export default {
           return json({ error: 'Timestamp expired or invalid' }, 401, corsOrigin);
         }
 
-        if (typeof body.signature !== 'string' || body.signature.length < 80 || body.signature.length > 100) {
+        if (typeof body.signature !== 'string' || body.signature.length < 80 || body.signature.length > 300) {
           return json({ error: 'Invalid signature format' }, 401, corsOrigin);
         }
 
-        // Cryptographic BIP-137 verification
+        // Cryptographic signature verification (BIP-137 or BIP-322)
         const delistMsg = `ordinals-ledger | delist | ${body.seller_btc_address} | ${id} | ${body.timestamp}`;
-        const delistSigErr = await verifyBip137(body.signature, delistMsg, body.seller_btc_address);
+        const delistSigErr = await verifySignature(body.signature, delistMsg, body.seller_btc_address);
         if (delistSigErr) return json({ error: delistSigErr }, 401, corsOrigin);
 
         // Verify listing exists and seller matches
