@@ -5,6 +5,7 @@
 import * as secp from '@noble/secp256k1';
 import { sha256 } from '@noble/hashes/sha256';
 import { ripemd160 } from '@noble/hashes/ripemd160';
+import { schnorr } from '@noble/curves/secp256k1';
 
 interface Env {
   DB: D1Database;
@@ -306,7 +307,7 @@ async function verifyBip137(signature: string, message: string, expectedAddress:
   return null; // verified
 }
 
-// --- BIP-322 Simple Signature Verification (P2WPKH / bc1q) ---
+// --- BIP-322 Simple Signature Verification (P2WPKH / bc1q and P2TR / bc1p) ---
 
 function bip322TaggedHash(message: string): Uint8Array {
   const tag = sha256(new TextEncoder().encode('BIP0322-signed-message'));
@@ -540,10 +541,175 @@ async function verifyBip322(signature: string, message: string, expectedAddress:
   return null; // verified
 }
 
+// --- BIP-322 Simple Signature Verification (P2TR / bc1p — Taproot key-path) ---
+
+/**
+ * Tagged hash as defined in BIP-340/BIP-341: SHA256(SHA256(tag) || SHA256(tag) || data)
+ */
+function taggedHash(tag: string, ...data: Uint8Array[]): Uint8Array {
+  const tagHash = sha256(new TextEncoder().encode(tag));
+  const totalLen = tagHash.length * 2 + data.reduce((s, d) => s + d.length, 0);
+  const buf = new Uint8Array(totalLen);
+  buf.set(tagHash, 0);
+  buf.set(tagHash, tagHash.length);
+  let offset = tagHash.length * 2;
+  for (const d of data) {
+    buf.set(d, offset);
+    offset += d.length;
+  }
+  return sha256(buf);
+}
+
+async function verifyBip322Taproot(signature: string, message: string, expectedAddress: string): Promise<string | null> {
+  let sigBytes: Uint8Array;
+  try {
+    sigBytes = Uint8Array.from(atob(signature), c => c.charCodeAt(0));
+  } catch { return 'Invalid BIP-322 Taproot signature: not valid base64'; }
+
+  // Parse witness stack: first byte = number of witness items
+  // Taproot key-path spend has exactly 1 witness item (64-byte Schnorr sig, or 65 with sighash type)
+  if (sigBytes.length < 2 || sigBytes[0] !== 0x01) {
+    return 'Invalid BIP-322 Taproot signature: expected 1 witness item';
+  }
+
+  // Read the Schnorr signature
+  let offset = 1;
+  const schnorrSigLen = sigBytes[offset];
+  offset += 1;
+  if (schnorrSigLen !== 64 && schnorrSigLen !== 65) {
+    return `Invalid BIP-322 Taproot signature: expected 64 or 65-byte Schnorr signature, got ${schnorrSigLen}`;
+  }
+  if (offset + schnorrSigLen > sigBytes.length) {
+    return 'Invalid BIP-322 Taproot signature: signature truncated';
+  }
+  const schnorrSig = sigBytes.slice(offset, offset + 64); // first 64 bytes are the signature
+  // If 65 bytes, the last byte is the sighash type; for SIGHASH_DEFAULT (0x00) it is omitted (64 bytes)
+  if (schnorrSigLen === 65) {
+    const sighashType = sigBytes[offset + 64];
+    if (sighashType !== 0x00 && sighashType !== 0x01) {
+      return `Invalid BIP-322 Taproot signature: unsupported sighash type 0x${sighashType.toString(16).padStart(2, '0')}`;
+    }
+  }
+
+  // Decode the bc1p address to get the x-only pubkey (32-byte witness program)
+  const decoded = decodeBech32Address(expectedAddress);
+  if (!decoded || decoded.version !== 1 || decoded.program.length !== 32) {
+    return 'BIP-322 Taproot verification requires a P2TR (bc1p) address with 32-byte witness program';
+  }
+  const xOnlyPubkey = decoded.program;
+
+  // --- Construct the "to_spend" transaction ---
+  const messageChallenge = bip322TaggedHash(message);
+
+  // scriptSig for to_spend input: OP_0 OP_PUSH32 <message_challenge>
+  const scriptSig = new Uint8Array(34);
+  scriptSig[0] = 0x00; // OP_0
+  scriptSig[1] = 0x20; // OP_PUSH32
+  scriptSig.set(messageChallenge, 2);
+
+  // P2TR scriptPubKey for to_spend output: OP_1 OP_PUSH32 <x-only-pubkey>
+  const scriptPubKey = new Uint8Array(34);
+  scriptPubKey[0] = 0x51; // OP_1 (witness version 1)
+  scriptPubKey[1] = 0x20; // OP_PUSH32
+  scriptPubKey.set(xOnlyPubkey, 2);
+
+  const toSpend = concatBytes(
+    writeUint32LE(0),                   // version = 0
+    new Uint8Array([0x01]),             // 1 input
+    new Uint8Array(32),                 // txid = 0x00...00 (32 zero bytes)
+    writeUint32LE(0xFFFFFFFF),          // vout = 0xFFFFFFFF
+    encodeVarint(scriptSig.length),     // scriptSig length
+    scriptSig,                          // scriptSig
+    writeUint32LE(0),                   // sequence = 0
+    new Uint8Array([0x01]),             // 1 output
+    writeUint64LE(0),                   // value = 0
+    encodeVarint(scriptPubKey.length),  // scriptPubKey length
+    scriptPubKey,                       // scriptPubKey
+    writeUint32LE(0)                    // locktime = 0
+  );
+
+  const toSpendTxid = doubleSha256(toSpend);
+
+  // --- Compute BIP-341 (Taproot) sighash for to_sign transaction ---
+  // The to_sign transaction spends the to_spend output using key-path spend.
+  // We compute the sighash following BIP-341 Annex A (SIGHASH_DEFAULT = 0x00).
+  //
+  // SigMsg(hash_type=0x00, ext_flag=0):
+  //   epoch (0x00)
+  //   hash_type (0x00)
+  //   nVersion (little-endian i32)
+  //   nLockTime (little-endian u32)
+  //   sha256(outpoints)   — all prevout outpoints serialized
+  //   sha256(amounts)     — all prevout amounts serialized (i64 LE)
+  //   sha256(scriptpubkeys) — all prevout scriptPubKeys (length-prefixed)
+  //   sha256(sequences)   — all input nSequence values serialized
+  //   sha256(outputs)     — all outputs serialized
+  //   spend_type (ext_flag * 2 + annex_present) = 0x00
+  //   input_index (u32 LE) = 0
+
+  // outpoint = toSpendTxid || vout(0)
+  const outpoint = concatBytes(toSpendTxid, writeUint32LE(0));
+
+  // sha_outpoints = SHA256(outpoint)
+  const shaOutpoints = sha256(outpoint);
+
+  // sha_amounts = SHA256(amount) where amount = 0 (i64 LE)
+  const shaAmounts = sha256(writeUint64LE(0));
+
+  // sha_scriptpubkeys = SHA256(length-prefixed scriptPubKey of the prevout)
+  // The prevout scriptPubKey is the P2TR output from to_spend
+  const scriptPubKeyPrefixed = new Uint8Array(1 + scriptPubKey.length);
+  scriptPubKeyPrefixed[0] = scriptPubKey.length;
+  scriptPubKeyPrefixed.set(scriptPubKey, 1);
+  const shaScriptpubkeys = sha256(scriptPubKeyPrefixed);
+
+  // sha_sequences = SHA256(sequence) where sequence = 0 (u32 LE)
+  const shaSequences = sha256(writeUint32LE(0));
+
+  // sha_outputs = SHA256(serialized outputs of to_sign)
+  // The to_sign output: value = 0, scriptPubKey = OP_RETURN (0x6a)
+  const toSignOutput = concatBytes(
+    writeUint64LE(0),                   // value = 0
+    new Uint8Array([0x01, 0x6a])        // scriptPubKey length=1, OP_RETURN
+  );
+  const shaOutputs = sha256(toSignOutput);
+
+  // Assemble the SigMsg preimage
+  const sigMsg = concatBytes(
+    new Uint8Array([0x00]),             // epoch
+    new Uint8Array([0x00]),             // hash_type = SIGHASH_DEFAULT
+    writeUint32LE(0),                   // nVersion = 0
+    writeUint32LE(0),                   // nLockTime = 0
+    shaOutpoints,                       // sha256(outpoints)
+    shaAmounts,                         // sha256(amounts)
+    shaScriptpubkeys,                   // sha256(scriptpubkeys)
+    shaSequences,                       // sha256(sequences)
+    shaOutputs,                         // sha256(outputs)
+    new Uint8Array([0x00]),             // spend_type = 0 (key-path, no annex)
+    writeUint32LE(0)                    // input_index = 0
+  );
+
+  // The sighash is: tagged_hash("TapSighash", sigMsg)
+  const sighash = taggedHash('TapSighash', sigMsg);
+
+  // Verify Schnorr signature against the sighash using the x-only pubkey
+  let isValid: boolean;
+  try {
+    isValid = schnorr.verify(schnorrSig, sighash, xOnlyPubkey);
+  } catch {
+    return 'BIP-322 Taproot signature verification error';
+  }
+
+  if (!isValid) return 'BIP-322 Taproot signature verification failed';
+
+  return null; // verified
+}
+
 /**
  * Detect signature format and route to the appropriate verifier.
  * BIP-137: base64-decoded is exactly 65 bytes.
- * BIP-322 simple (P2WPKH): base64-decoded starts with 0x02 (2 witness items) and is longer.
+ * BIP-322 simple (P2WPKH): base64-decoded starts with 0x02 (2 witness items).
+ * BIP-322 simple (P2TR):   base64-decoded starts with 0x01 (1 witness item — Schnorr sig).
  */
 async function verifySig(signature: string, message: string, expectedAddress: string): Promise<string | null> {
   let sigBytes: Uint8Array;
@@ -555,6 +721,12 @@ async function verifySig(signature: string, message: string, expectedAddress: st
     return verifyBip137(signature, message, expectedAddress);
   }
 
+  // BIP-322 P2TR (Taproot key-path): 1 witness item (0x01 prefix), bc1p address
+  if (sigBytes[0] === 0x01 && expectedAddress.toLowerCase().startsWith('bc1p')) {
+    return verifyBip322Taproot(signature, message, expectedAddress);
+  }
+
+  // BIP-322 P2WPKH: 2 witness items (0x02 prefix)
   if (sigBytes.length > 65 && sigBytes[0] === 0x02) {
     return verifyBip322(signature, message, expectedAddress);
   }
