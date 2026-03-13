@@ -980,7 +980,7 @@ export default {
 
         return json({ success: true, trade_id: result.meta.last_row_id }, 201, corsOrigin);
       } catch (e: any) {
-        return json({ error: 'Internal server error' }, 500, corsOrigin);
+        return json({ error: e instanceof Error ? e.message : String(e) }, 500, corsOrigin);
       }
     }
 
@@ -1123,7 +1123,7 @@ export default {
 
         return json({ success: true, btc_address: body.btc_address, taproot_address: body.taproot_address }, 200, corsOrigin);
       } catch (e: any) {
-        return json({ error: 'Internal server error' }, 500, corsOrigin);
+        return json({ error: e instanceof Error ? e.message : String(e) }, 500, corsOrigin);
       }
     }
 
@@ -1324,7 +1324,7 @@ export default {
 
         return json({ success: true, listing_id: result.meta.last_row_id }, 201, corsOrigin);
       } catch (e: any) {
-        return json({ error: 'Internal server error' }, 500, corsOrigin);
+        return json({ error: e instanceof Error ? e.message : String(e) }, 500, corsOrigin);
       }
     }
 
@@ -1443,7 +1443,7 @@ export default {
 
         return json({ success: true }, 200, corsOrigin);
       } catch (e: any) {
-        return json({ error: 'Internal server error' }, 500, corsOrigin);
+        return json({ error: e instanceof Error ? e.message : String(e) }, 500, corsOrigin);
       }
     }
 
@@ -1457,7 +1457,7 @@ export default {
     return json({ error: 'Not found' }, 404, corsOrigin);
     } catch (e: any) {
       console.error('Unhandled error:', e?.message);
-      return json({ error: 'Internal server error' }, 500, corsOrigin);
+      return json({ error: e instanceof Error ? e.message : String(e) }, 500, corsOrigin);
     }
   },
 
