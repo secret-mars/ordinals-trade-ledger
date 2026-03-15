@@ -474,12 +474,178 @@ async function verifyBip322P2WPKH(signature: string, message: string, expectedAd
   return null;
 }
 
-// Unified signature verification: auto-detects BIP-137 vs BIP-322
+// --- BIP-322 Signature Verification (P2TR / Taproot) ---
+
+function bip341TaggedHash(tag: string, data: Uint8Array): Uint8Array {
+  const tagHash = sha256(new TextEncoder().encode(tag));
+  const buf = new Uint8Array(tagHash.length * 2 + data.length);
+  buf.set(tagHash, 0);
+  buf.set(tagHash, tagHash.length);
+  buf.set(data, tagHash.length * 2);
+  return sha256(buf);
+}
+
+function decodeBech32Address(addr: string): { version: number; program: Uint8Array } | null {
+  const lowerAddr = addr.toLowerCase();
+  const pos = lowerAddr.lastIndexOf('1');
+  if (pos < 1) return null;
+  const hrp = lowerAddr.slice(0, pos);
+  if (hrp !== 'bc' && hrp !== 'tb') return null;
+
+  const CHARSET = 'qpzry9x8gf2tvdw0s3jn54khce6mua7l';
+  const dataChars = lowerAddr.slice(pos + 1);
+  const data: number[] = [];
+  for (const c of dataChars) {
+    const idx = CHARSET.indexOf(c);
+    if (idx === -1) return null;
+    data.push(idx);
+  }
+
+  const expand = [...Array.from(hrp, c => c.charCodeAt(0) >> 5), 0, ...Array.from(hrp, c => c.charCodeAt(0) & 31)];
+  const values = [...expand, ...data];
+  const polymod = bech32Polymod(values);
+  const version = data[0];
+  const expectedPolymod = version === 0 ? 1 : 0x2bc830a3;
+  if (polymod !== expectedPolymod) return null;
+
+  const payload = data.slice(1, data.length - 6);
+  let acc = 0, bits = 0;
+  const program: number[] = [];
+  for (const val of payload) {
+    acc = (acc << 5) | val;
+    bits += 5;
+    while (bits >= 8) {
+      bits -= 8;
+      program.push((acc >> bits) & 0xff);
+    }
+  }
+  return { version, program: new Uint8Array(program) };
+}
+
+function writeUint32LE(value: number): Uint8Array {
+  const buf = new Uint8Array(4);
+  buf[0] = value & 0xff;
+  buf[1] = (value >>> 8) & 0xff;
+  buf[2] = (value >>> 16) & 0xff;
+  buf[3] = (value >>> 24) & 0xff;
+  return buf;
+}
+
+function writeUint64LE(value: number): Uint8Array {
+  const buf = new Uint8Array(8);
+  buf[0] = value & 0xff;
+  buf[1] = (value >>> 8) & 0xff;
+  buf[2] = (value >>> 16) & 0xff;
+  buf[3] = (value >>> 24) & 0xff;
+  return buf;
+}
+
+function concatUint8(...arrays: Uint8Array[]): Uint8Array {
+  const total = arrays.reduce((sum, a) => sum + a.length, 0);
+  const result = new Uint8Array(total);
+  let offset = 0;
+  for (const a of arrays) { result.set(a, offset); offset += a.length; }
+  return result;
+}
+
+async function verifyBip322Taproot(signature: string, message: string, expectedAddress: string): Promise<string | null> {
+  let sigBytes: Uint8Array;
+  try {
+    sigBytes = Uint8Array.from(atob(signature), c => c.charCodeAt(0));
+  } catch { return 'Invalid BIP-322 Taproot signature: not valid base64'; }
+
+  if (sigBytes.length < 2 || sigBytes[0] !== 0x01) {
+    return 'Invalid BIP-322 Taproot signature: expected 1 witness item';
+  }
+
+  const schnorrLen = sigBytes[1];
+  if (schnorrLen !== 0x40) {
+    return `Invalid BIP-322 Taproot signature: expected 64-byte Schnorr sig, got ${schnorrLen}`;
+  }
+  if (sigBytes.length < 2 + 64) {
+    return 'Invalid BIP-322 Taproot signature: signature data truncated';
+  }
+  const schnorrSig = sigBytes.slice(2, 2 + 64);
+
+  const decoded = decodeBech32Address(expectedAddress);
+  if (!decoded || decoded.version !== 1 || decoded.program.length !== 32) {
+    return 'BIP-322 Taproot verification only supports P2TR (bc1p) addresses';
+  }
+  const xOnlyPubkey = decoded.program;
+
+  // Build P2TR scriptPubKey: OP_1 OP_PUSH32 <x-only-pubkey>
+  const scriptPubKey = new Uint8Array(34);
+  scriptPubKey[0] = 0x51; // OP_1
+  scriptPubKey[1] = 0x20; // OP_PUSH32
+  scriptPubKey.set(xOnlyPubkey, 2);
+
+  // Build to_spend transaction and get its txid
+  const toSpendTx = buildToSpendTx(message, scriptPubKey);
+  const toSpendTxid = sha256d(toSpendTx);
+
+  // Compute BIP-341 sighash (key-path, SIGHASH_DEFAULT)
+  const outpoint = concatUint8(toSpendTxid, writeUint32LE(0));
+  const hashPrevouts = sha256(outpoint);
+  const hashAmounts = sha256(writeUint64LE(0));
+  const hashScriptPubKeys = sha256(concatUint8(encodeVarint(scriptPubKey.length), scriptPubKey));
+  const hashSequences = sha256(writeUint32LE(0));
+  const toSignOutput = concatUint8(writeUint64LE(0), new Uint8Array([0x01, 0x6a]));
+  const hashOutputs = sha256(toSignOutput);
+
+  const sighashPreimage = concatUint8(
+    new Uint8Array([0x00]),       // epoch
+    new Uint8Array([0x00]),       // sighash_type = SIGHASH_DEFAULT
+    writeUint32LE(0),             // version
+    writeUint32LE(0),             // locktime
+    hashPrevouts, hashAmounts, hashScriptPubKeys, hashSequences, hashOutputs,
+    new Uint8Array([0x00]),       // spend_type (key-path, no annex)
+    writeUint32LE(0)              // input_index
+  );
+  const sighash = bip341TaggedHash('TapSighash', sighashPreimage);
+
+  // BIP-340 Schnorr verification
+  let isValid: boolean;
+  try {
+    const n = secp.CURVE.n;
+    const r = secp.etc.bytesToNumberBE(schnorrSig.slice(0, 32));
+    const s = secp.etc.bytesToNumberBE(schnorrSig.slice(32, 64));
+    if (r === 0n || s === 0n || r >= secp.CURVE.p || s >= n) {
+      return 'BIP-322 Taproot: r or s out of range';
+    }
+    const compressedPubkey = new Uint8Array(33);
+    compressedPubkey[0] = 0x02;
+    compressedPubkey.set(xOnlyPubkey, 1);
+    const P = secp.Point.fromBytes(compressedPubkey);
+    const rBytes = secp.etc.numberToBytesBE(r);
+    const challengeHash = bip341TaggedHash('BIP0340/challenge', concatUint8(rBytes, xOnlyPubkey, sighash));
+    const e = secp.etc.mod(secp.etc.bytesToNumberBE(challengeHash), n);
+    const R = secp.Point.BASE.multiply(s).add(P.multiply(e).negate());
+    if (R.is0()) {
+      isValid = false;
+    } else {
+      const Raffine = R.toAffine();
+      isValid = Raffine.x === r && (Raffine.y & 1n) === 0n;
+    }
+  } catch { return 'BIP-322 Taproot: Schnorr verification error'; }
+
+  if (!isValid) return 'BIP-322 Taproot signature verification failed';
+  return null;
+}
+
+// Unified signature verification: dispatch by address type, then format
 async function verifySignature(signature: string, message: string, expectedAddress: string): Promise<string | null> {
   let sigBytes: Uint8Array;
   try {
     sigBytes = Uint8Array.from(atob(signature), c => c.charCodeAt(0));
   } catch { return 'Invalid signature: not valid base64'; }
+
+  // Route by address prefix for BIP-322 variants (more robust than byte inspection)
+  if (expectedAddress.startsWith('bc1p') || expectedAddress.startsWith('tb1p')) {
+    if (sigBytes.length === 65 && sigBytes[0] >= 27 && sigBytes[0] <= 42) {
+      return 'Taproot address requires BIP-322 signature, got BIP-137';
+    }
+    return verifyBip322Taproot(signature, message, expectedAddress);
+  }
 
   // BIP-137: exactly 65 bytes, header byte 27-42
   if (sigBytes.length === 65 && sigBytes[0] >= 27 && sigBytes[0] <= 42) {
