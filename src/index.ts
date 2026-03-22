@@ -1627,6 +1627,11 @@ export default {
         const listingSigErr = await verifySignature(body.signature, listingMsg, body.seller_btc_address);
         if (listingSigErr) return json({ error: listingSigErr }, 401, corsOrigin);
 
+        // Replay protection (prevent signature reuse within timestamp window)
+        await cleanupExpiredSignatures(env.DB);
+        const listingReplayErr = await recordSignatureUse(env.DB, await sha256Hex(body.signature));
+        if (listingReplayErr) return json({ error: listingReplayErr }, 409, corsOrigin);
+
         // Check no active listing for same inscription by same seller
         const existing = await env.DB
           .prepare("SELECT id FROM listings WHERE inscription_id = ? AND seller_btc_address = ? AND status = 'active'")
@@ -1748,6 +1753,11 @@ export default {
         const delistMsg = `ordinals-ledger | delist | ${body.seller_btc_address} | ${id} | ${body.timestamp}`;
         const delistSigErr = await verifySignature(body.signature, delistMsg, body.seller_btc_address);
         if (delistSigErr) return json({ error: delistSigErr }, 401, corsOrigin);
+
+        // Replay protection (prevent signature reuse within timestamp window)
+        await cleanupExpiredSignatures(env.DB);
+        const delistReplayErr = await recordSignatureUse(env.DB, await sha256Hex(body.signature));
+        if (delistReplayErr) return json({ error: delistReplayErr }, 409, corsOrigin);
 
         // Verify listing exists and seller matches
         const listing = await env.DB
