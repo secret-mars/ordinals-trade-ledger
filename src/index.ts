@@ -980,6 +980,7 @@ export default {
 
         return json({ success: true, trade_id: result.meta.last_row_id }, 201, corsOrigin);
       } catch (e: any) {
+        console.error('POST /api/trades failed:', e?.message, e?.stack);
         return json({ error: 'Internal server error' }, 500, corsOrigin);
       }
     }
@@ -1123,6 +1124,7 @@ export default {
 
         return json({ success: true, btc_address: body.btc_address, taproot_address: body.taproot_address }, 200, corsOrigin);
       } catch (e: any) {
+        console.error('POST /api/agents/taproot failed:', e?.message, e?.stack);
         return json({ error: 'Internal server error' }, 500, corsOrigin);
       }
     }
@@ -1293,6 +1295,11 @@ export default {
         const listingSigErr = await verifyBip137(body.signature, listingMsg, body.seller_btc_address);
         if (listingSigErr) return json({ error: listingSigErr }, 401, corsOrigin);
 
+        // Replay protection (prevent signature reuse within timestamp window)
+        await cleanupExpiredSignatures(env.DB);
+        const listingReplayErr = await recordSignatureUse(env.DB, await sha256Hex(body.signature));
+        if (listingReplayErr) return json({ error: listingReplayErr }, 409, corsOrigin);
+
         // Check no active listing for same inscription by same seller
         const existing = await env.DB
           .prepare("SELECT id FROM listings WHERE inscription_id = ? AND seller_btc_address = ? AND status = 'active'")
@@ -1324,6 +1331,7 @@ export default {
 
         return json({ success: true, listing_id: result.meta.last_row_id }, 201, corsOrigin);
       } catch (e: any) {
+        console.error('POST /api/listings failed:', e?.message, e?.stack);
         return json({ error: 'Internal server error' }, 500, corsOrigin);
       }
     }
@@ -1415,6 +1423,11 @@ export default {
         const delistSigErr = await verifyBip137(body.signature, delistMsg, body.seller_btc_address);
         if (delistSigErr) return json({ error: delistSigErr }, 401, corsOrigin);
 
+        // Replay protection (prevent signature reuse within timestamp window)
+        await cleanupExpiredSignatures(env.DB);
+        const delistReplayErr = await recordSignatureUse(env.DB, await sha256Hex(body.signature));
+        if (delistReplayErr) return json({ error: delistReplayErr }, 409, corsOrigin);
+
         // Verify listing exists and seller matches
         const listing = await env.DB
           .prepare("SELECT * FROM listings WHERE id = ? AND status = 'active'")
@@ -1443,6 +1456,7 @@ export default {
 
         return json({ success: true }, 200, corsOrigin);
       } catch (e: any) {
+        console.error('PATCH /api/listings failed:', e?.message, e?.stack);
         return json({ error: 'Internal server error' }, 500, corsOrigin);
       }
     }
