@@ -1329,6 +1329,12 @@ export default {
       const limit = Math.min(Math.max(isNaN(limitRaw) ? 50 : limitRaw, 1), 200);
       const offset = Math.max(isNaN(offsetRaw) ? 0 : offsetRaw, 0);
 
+      // Validate enum params
+      const VALID_TYPES = new Set(['offer', 'counter', 'transfer', 'cancel', 'psbt_swap']);
+      const VALID_STATUSES = new Set(['open', 'countered', 'completed', 'cancelled']);
+      if (type && !VALID_TYPES.has(type)) return json({ error: `Invalid type filter. Must be: ${[...VALID_TYPES].join(', ')}` }, 400, corsOrigin);
+      if (status && !VALID_STATUSES.has(status)) return json({ error: `Invalid status filter. Must be: ${[...VALID_STATUSES].join(', ')}` }, 400, corsOrigin);
+
       let query = `
         SELECT t.*,
           fa.display_name as from_name, fa.stx_address as from_stx,
@@ -1349,6 +1355,7 @@ export default {
       params.push(limit, offset);
 
       const trades = await env.DB.prepare(query).bind(...params).all();
+      if (!trades.success) throw new Error('D1 query failed for trades list');
 
       // Get total count for pagination
       let countQuery = 'SELECT COUNT(*) as total FROM trades WHERE 1=1';
@@ -1677,6 +1684,12 @@ export default {
       const offsetRaw = parseInt(url.searchParams.get('offset') || '0');
       const lim = Math.min(Math.max(isNaN(limitRaw) ? 50 : limitRaw, 1), 200);
       const off = Math.max(isNaN(offsetRaw) ? 0 : offsetRaw, 0);
+
+      // Validate enum params
+      const VALID_LISTING_STATUSES = new Set(['active', 'sold', 'cancelled', 'all']);
+      const VALID_SORTS = new Set(['newest', 'cheapest', 'expensive']);
+      if (!VALID_LISTING_STATUSES.has(status)) return json({ error: `Invalid status. Must be: ${[...VALID_LISTING_STATUSES].join(', ')}` }, 400, corsOrigin);
+      if (!VALID_SORTS.has(sort)) return json({ error: `Invalid sort. Must be: ${[...VALID_SORTS].join(', ')}` }, 400, corsOrigin);
 
       let query = `
         SELECT l.*, a.display_name as seller_name, a.stx_address as seller_stx
