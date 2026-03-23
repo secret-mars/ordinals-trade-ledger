@@ -782,6 +782,23 @@ async function cleanupExpiredRateLimits(db: D1Database): Promise<void> {
     .run();
 }
 
+// Shared auth: timestamp + signature format + BIP verify + replay protection
+// Used by all write endpoints (trades, taproot, listings, delist)
+async function validateSignedRequest(
+  signature: string | undefined, timestamp: string | undefined, message: string, signerAddress: string, db: D1Database
+): Promise<string | null> {
+  if (!signature || !timestamp) return 'Required: signature, timestamp';
+  if (typeof signature !== 'string' || signature.length < 80 || signature.length > 300) return 'Invalid signature format';
+  const ts = new Date(timestamp).getTime();
+  if (isNaN(ts) || Math.abs(Date.now() - ts) > 300_000) return 'Timestamp expired or invalid (must be within 300s)';
+  const sigErr = await verifySignature(signature, message, signerAddress);
+  if (sigErr) return sigErr;
+  await cleanupExpiredSignatures(db);
+  const replayErr = await recordSignatureUse(db, await sha256Hex(signature));
+  if (replayErr) return replayErr;
+  return null;
+}
+
 // Auth: require BIP-137 or BIP-322 signature on all write endpoints
 // Signature message format: "ordinals-ledger | {type} | {from_agent} | {inscription_id} | {timestamp}"
 // Timestamp must be within 300 seconds of server time
@@ -1419,31 +1436,10 @@ export default {
           return json({ error: 'taproot_address must be a valid taproot address (bc1p...)' }, 400, corsOrigin);
         }
 
-        // Auth: require signature (BIP-137 or BIP-322)
-        if (!body.signature || !body.timestamp) {
-          return json({ error: 'Required: signature (BIP-137 or BIP-322), timestamp (ISO 8601)' }, 401, corsOrigin);
-        }
-
-        const ts = new Date(body.timestamp).getTime();
-        if (isNaN(ts) || Math.abs(Date.now() - ts) > 300_000) {
-          return json({ error: 'Timestamp expired or invalid (must be within 300s)' }, 401, corsOrigin);
-        }
-
-        if (typeof body.signature !== 'string' || body.signature.length < 80 || body.signature.length > 300) {
-          return json({ error: 'Invalid signature format' }, 401, corsOrigin);
-        }
-
-        // Cryptographic signature verification (BIP-137 or BIP-322)
+        // Auth: shared validation (timestamp + sig format + verify + replay)
         const taprootMsg = `ordinals-ledger | taproot | ${body.btc_address} | ${body.taproot_address} | ${body.timestamp}`;
-        const taprootSigErr = await verifySignature(body.signature, taprootMsg, body.btc_address);
-        if (taprootSigErr) return json({ error: taprootSigErr }, 401, corsOrigin);
-
-        // Replay protection: reject signatures that have already been used.
-        // Cleanup of entries older than 24h is done lazily so the table stays bounded.
-        await cleanupExpiredSignatures(env.DB);
-        const sigHash = await sha256Hex(body.signature!);
-        const replayErr = await recordSignatureUse(env.DB, sigHash);
-        if (replayErr) return json({ error: replayErr }, 409, corsOrigin);
+        const taprootAuthErr = await validateSignedRequest(body.signature, body.timestamp, taprootMsg, body.btc_address!, env.DB);
+        if (taprootAuthErr) return json({ error: taprootAuthErr }, taprootAuthErr.includes('replay') ? 409 : 401, corsOrigin);
 
         // Check agent exists
         const agent = await env.DB
@@ -1615,29 +1611,10 @@ export default {
           return json({ error: 'price_floor_sats exceeds maximum (21M BTC)' }, 400, corsOrigin);
         }
 
-        // Auth: seller must sign
-        if (!body.signature || !body.timestamp) {
-          return json({ error: 'Required: signature (BIP-137 or BIP-322), timestamp (ISO 8601)' }, 401, corsOrigin);
-        }
-
-        const ts = new Date(body.timestamp).getTime();
-        if (isNaN(ts) || Math.abs(Date.now() - ts) > 300_000) {
-          return json({ error: 'Timestamp expired or invalid (must be within 300s)' }, 401, corsOrigin);
-        }
-
-        if (typeof body.signature !== 'string' || body.signature.length < 80 || body.signature.length > 300) {
-          return json({ error: 'Invalid signature format' }, 401, corsOrigin);
-        }
-
-        // Cryptographic signature verification (BIP-137 or BIP-322)
+        // Auth: shared validation (timestamp + sig format + verify + replay)
         const listingMsg = `ordinals-ledger | listing | ${body.seller_btc_address} | ${body.inscription_id} | ${body.timestamp}`;
-        const listingSigErr = await verifySignature(body.signature, listingMsg, body.seller_btc_address);
-        if (listingSigErr) return json({ error: listingSigErr }, 401, corsOrigin);
-
-        // Replay protection (prevent signature reuse within timestamp window)
-        await cleanupExpiredSignatures(env.DB);
-        const listingReplayErr = await recordSignatureUse(env.DB, await sha256Hex(body.signature));
-        if (listingReplayErr) return json({ error: listingReplayErr }, 409, corsOrigin);
+        const listingAuthErr = await validateSignedRequest(body.signature, body.timestamp, listingMsg, body.seller_btc_address!, env.DB);
+        if (listingAuthErr) return json({ error: listingAuthErr }, listingAuthErr.includes('replay') ? 409 : 401, corsOrigin);
 
         // Check no active listing for same inscription by same seller
         const existing = await env.DB
@@ -1753,24 +1730,10 @@ export default {
           return json({ error: 'Invalid seller_btc_address' }, 400, corsOrigin);
         }
 
-        const ts = new Date(body.timestamp).getTime();
-        if (isNaN(ts) || Math.abs(Date.now() - ts) > 300_000) {
-          return json({ error: 'Timestamp expired or invalid' }, 401, corsOrigin);
-        }
-
-        if (typeof body.signature !== 'string' || body.signature.length < 80 || body.signature.length > 300) {
-          return json({ error: 'Invalid signature format' }, 401, corsOrigin);
-        }
-
-        // Cryptographic signature verification (BIP-137 or BIP-322)
+        // Auth: shared validation (timestamp + sig format + verify + replay)
         const delistMsg = `ordinals-ledger | delist | ${body.seller_btc_address} | ${id} | ${body.timestamp}`;
-        const delistSigErr = await verifySignature(body.signature, delistMsg, body.seller_btc_address);
-        if (delistSigErr) return json({ error: delistSigErr }, 401, corsOrigin);
-
-        // Replay protection (prevent signature reuse within timestamp window)
-        await cleanupExpiredSignatures(env.DB);
-        const delistReplayErr = await recordSignatureUse(env.DB, await sha256Hex(body.signature));
-        if (delistReplayErr) return json({ error: delistReplayErr }, 409, corsOrigin);
+        const delistAuthErr = await validateSignedRequest(body.signature, body.timestamp, delistMsg, body.seller_btc_address!, env.DB);
+        if (delistAuthErr) return json({ error: delistAuthErr }, delistAuthErr.includes('replay') ? 409 : 401, corsOrigin);
 
         // Verify listing exists and seller matches
         const listing = await env.DB
